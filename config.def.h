@@ -97,7 +97,7 @@ static KeyBinding basic_movement[] = {
 static KeyBinding vis_movements[] = {
 	BACKSPACE(                     movement,        i,  MOVE_CHAR_PREV             ),
 	{ { NONE('h')               }, movement,     { .i = MOVE_CHAR_PREV           } },
-	{ { NONE(' ')               }, movement,     { .i = MOVE_CHAR_NEXT           } },
+	{ { NONE(' ')               }, wscroll,      { .i = +PAGE                    } },
 	{ { NONE('l')               }, movement,     { .i = MOVE_CHAR_NEXT           } },
 	{ { NONE('k')               }, movement,     { .i = MOVE_LINE_UP             } },
 	{ { CONTROL('P')            }, movement,     { .i = MOVE_LINE_UP             } },
@@ -405,6 +405,7 @@ static KeyBinding vis_mode_normal[] = {
 	{ { CONTROL('R')            }, redo,           { NULL                      } },
 	{ { CONTROL('L')            }, call,           { .f = editor_draw          } },
 	{ { NONE(':')               }, prompt_cmd,     { .s = ""                   } },
+	{ { NONE(';')               }, prompt_cmd,     { .s = ""                   } },
 	{ { NONE('Z'), NONE('Z')    }, cmd,            { .s = "wq"                 } },
 	{ { NONE('Z'), NONE('Q')    }, cmd,            { .s = "q!"                 } },
 	{ { NONE('z'), NONE('t')    }, window,         { .w = window_redraw_top    } },
