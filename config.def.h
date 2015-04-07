@@ -1259,5 +1259,19 @@ static Syntax syntaxes[] = {{
 		&colors[COLOR_DATATYPE],
 	}}
 },{
+	.name = "text",
+	.file = "\\.txt$",
+	.rules = {
+	{ /* comment */
+		"--.*--",
+		&colors[COLOR_DATATYPE],
+	},{ /* done */
+		"\\[done\\]",
+		&colors[COLOR_COMMENT],
+	},{ /* todo */
+		"\\[.*\\]",
+		&colors[COLOR_LITERAL],
+	}}
+},{
 	/* empty last element, array terminator */
 }};
