@@ -194,6 +194,7 @@ static void ui_window_reload(UiWin *w, Text *text) {
 }
 
 static void ui_window_draw_sidebar(UiCursesWin *win, const Line *line) {
+	wattrset(win->winside,COLOR_PAIR(5));
 	if (!win->winside || !line)
 		return;
 	int sidebar_width = snprintf(NULL, 0, "%zd", line->lineno + win->height - 2) + 1;
@@ -219,7 +220,7 @@ static void ui_window_draw_sidebar(UiCursesWin *win, const Line *line) {
 			}
 			prev_lineno = l->lineno;
 		}
-		mvwvline(win->winside, 0, sidebar_width-1, ACS_VLINE, win->height-1);
+		mvwvline(win->winside, 0, sidebar_width-1, ' ', win->height-1);
 	}
 }
 
