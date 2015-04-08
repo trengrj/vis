@@ -470,6 +470,8 @@ static void vis_mode_visual_line_leave(Mode *new) {
 	if (!new->visual) {
 		window_selection_clear(vis->win->win);
 		vis_modes[VIS_MODE_OPERATOR].parent = &vis_modes[VIS_MODE_MOVE];
+	} else {
+		window_cursor_to(vis->win->win, window_cursor_get(vis->win->win));
 	}
 }
 
@@ -1031,6 +1033,51 @@ static Syntax syntaxes[] = {{
 		B"(abstract|class|extends|final|implements|import|instanceof|interface|native|package|private|protected|public|static|strictfp|this|super|synchronized|throws|volatile)"B,
 		&colors[COLOR_KEYWORD2],
 	}}
+},{
+	.name = "lua",
+	.file = "\\.lua$",
+	.settings = (const char*[]){
+		"set number",
+		"set autoindent",
+		NULL
+	},
+	.rules = {{
+		"--\\[(=*)\\[([^]]*)\\](=*)\\]",
+		&colors[COLOR_COMMENT],
+		true,
+	},{
+		"--.*$",
+		&colors[COLOR_COMMENT],
+	},{
+		"(\\[(=*)\\[([^]]*)\\](=*)\\]|^([^][]*)\\](=*)\\])",
+		&colors[COLOR_STRING],
+		true,
+	},
+		SYNTAX_STRING,
+	{
+		B"([0-9]*\\.)?[0-9]+([eE]([\\+-])?[0-9]+)?"B,
+		&colors[COLOR_LITERAL],
+	},{
+		B"0x[0-9a-fA-F]+"B,
+		&colors[COLOR_LITERAL],
+	},{
+		B"(false|nil|true)"B,
+		&colors[COLOR_CONSTANT],
+	},{
+		"(\\.\\.\\.)",
+		&colors[COLOR_CONSTANT],
+	},{
+		B"(break|do|else|elseif|end|for|function|if|in|local|repeat|return|then|until|while)"B,
+		&colors[COLOR_KEYWORD],
+	},{
+		B"(and|not|or)"B,
+		&colors[COLOR_OPERATOR],
+	},{
+		"(\\+|-|\\*|/|%|\\^|#|[=~<>]=|<|>|\\.\\.)",
+		&colors[COLOR_OPERATOR],
+	},
+		SYNTAX_BRACKET,
+	}
 },{
 	.name = "ruby",
 	.file = "\\.rb$",
