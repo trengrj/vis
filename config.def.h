@@ -209,6 +209,7 @@ static KeyBinding vis_operators[] = {
 	{ { NONE('<')               }, operator,      { .i = OP_SHIFT_LEFT   } },
 	{ { NONE('g'), NONE('U')    }, changecase,    { .i = +1              } },
 	{ { NONE('~')               }, changecase,    { .i =  0              } },
+	{ { NONE('g'), NONE('~')    }, changecase,    { .i =  0              } },
 	{ { NONE('g'), NONE('u')    }, changecase,    { .i = -1              } },
 	{ /* empty last element, array terminator */                           },
 };
@@ -223,8 +224,8 @@ static void vis_mode_operator_leave(Mode *new) {
 
 static void vis_mode_operator_input(const char *str, size_t len) {
 	/* invalid operator */
-	action_reset(&action);
-	switchmode_to(mode_prev);
+	action_reset(&vis->action);
+	switchmode_to(vis->mode_prev);
 }
 
 static KeyBinding vis_operator_options[] = {
@@ -505,7 +506,7 @@ static void vis_mode_prompt_input(const char *str, size_t len) {
 
 static void vis_mode_prompt_enter(Mode *old) {
 	if (old->isuser && old != &vis_modes[VIS_MODE_PROMPT])
-		mode_before_prompt = old;
+		vis->mode_before_prompt = old;
 }
 
 static void vis_mode_prompt_leave(Mode *new) {
@@ -573,11 +574,11 @@ static void vis_mode_insert_input(const char *str, size_t len) {
 	static size_t oldpos = EPOS;
 	size_t pos = window_cursor_get(vis->win->win);
 	if (pos != oldpos)
-		buffer_truncate(&buffer_repeat);
-	buffer_append(&buffer_repeat, str, len);
+		buffer_truncate(&vis->buffer_repeat);
+	buffer_append(&vis->buffer_repeat, str, len);
 	oldpos = pos + len;
-	action_reset(&action_prev);
-	action_prev.op = &ops[OP_REPEAT_INSERT];
+	action_reset(&vis->action_prev);
+	vis->action_prev.op = &ops[OP_REPEAT_INSERT];
 	editor_insert_key(vis, str, len);
 }
 
@@ -595,11 +596,11 @@ static void vis_mode_replace_input(const char *str, size_t len) {
 	static size_t oldpos = EPOS;
 	size_t pos = window_cursor_get(vis->win->win);
 	if (pos != oldpos)
-		buffer_truncate(&buffer_repeat);
-	buffer_append(&buffer_repeat, str, len);
+		buffer_truncate(&vis->buffer_repeat);
+	buffer_append(&vis->buffer_repeat, str, len);
 	oldpos = pos + len;
-	action_reset(&action_prev);
-	action_prev.op = &ops[OP_REPEAT_REPLACE];
+	action_reset(&vis->action_prev);
+	vis->action_prev.op = &ops[OP_REPEAT_REPLACE];
 	editor_replace_key(vis, str, len);
 }
 

@@ -77,6 +77,12 @@ struct UiCursesWin {
 	enum UiOption options;    /* display settings for this window */
 };
 
+static volatile sig_atomic_t need_resize; /* TODO */
+
+static void sigwinch_handler(int sig) {
+	need_resize = true;
+}
+
 static unsigned int color_hash(short fg, short bg) {
 	if (fg == -1)
 		fg = COLORS;
@@ -166,7 +172,7 @@ static void ui_window_draw_status(UiWin *w) {
 	wattrset(win->winstatus, focused ? A_REVERSE|A_BOLD : A_REVERSE);
 	mvwhline(win->winstatus, 0, 0, ' ', win->width);
 	mvwprintw(win->winstatus, 0, 0, "%s %s %s %s",
-	          "", // TODO mode->name && mode->name[0] == '-' ? mode->name : "",
+	          vis->mode->name && vis->mode->name[0] == '-' ? vis->mode->name : "",
 	          filename ? filename : "[No Name]",
 	          text_modified(win->text) ? "[+]" : "",
 	          vis->recording ? "recording": "");
@@ -230,22 +236,6 @@ static void ui_window_update(UiCursesWin *win) {
 	if (win->winside)
 		wnoutrefresh(win->winside);
 	wnoutrefresh(win->win);
-}
-
-static void update(Ui *ui) {
-	UiCurses *uic = (UiCurses*)ui;
-	for (UiCursesWin *win = uic->windows; win; win = win->next) {
-		if (win != uic->selwin)
-			ui_window_update(win);
-	}
-
-	if (uic->selwin)
-		ui_window_update(uic->selwin);
-	if (uic->prompt_title[0]) {
-		wnoutrefresh(uic->prompt_win->win);
-		ui_window_update(uic->prompt_win);
-	}
-	doupdate();
 }
 
 static void arrange(Ui *ui, enum UiLayout layout) {
@@ -320,6 +310,26 @@ static void ui_resize(Ui *ui) {
 	resizeterm(height, width);
 	wresize(stdscr, height, width);
 	ui_resize_to(ui, width, height);
+}
+
+static void update(Ui *ui) {
+	UiCurses *uic = (UiCurses*)ui;
+	if (need_resize) {
+		ui_resize(ui);
+		need_resize = false;
+	}
+	for (UiCursesWin *win = uic->windows; win; win = win->next) {
+		if (win != uic->selwin)
+			ui_window_update(win);
+	}
+
+	if (uic->selwin)
+		ui_window_update(uic->selwin);
+	if (uic->prompt_title[0]) {
+		wnoutrefresh(uic->prompt_win->win);
+		ui_window_update(uic->prompt_win);
+	}
+	doupdate();
 }
 
 static void ui_window_free(UiWin *w) {
@@ -560,6 +570,13 @@ Ui *ui_curses_new(void) {
 		.color_get = color_get,
 	};
 
+	struct sigaction sa;
+	sa.sa_flags = 0;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_handler = sigwinch_handler;
+	sigaction(SIGWINCH, &sa, NULL);
+	sigaction(SIGCONT, &sa, NULL);
+	
 	ui_resize(ui);
 
 	return ui;

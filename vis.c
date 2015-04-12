@@ -38,127 +38,8 @@
 #include "util.h"
 #include "map.h"
 
-typedef union {
-	bool b;
-	int i;
-	const char *s;
-	void (*w)(Win*);    /* generic window commands */
-	void (*f)(Editor*); /* generic editor commands */
-} Arg;
-
-typedef struct {
-	char str[6]; /* UTF8 character or terminal escape code */
-	int code;    /* curses KEY_* constant */
-} Key;
-
-#define MAX_KEYS 2
-typedef Key KeyCombo[MAX_KEYS];
-
-typedef struct {
-	KeyCombo key;
-	void (*func)(const Arg *arg);
-	const Arg arg;
-} KeyBinding;
-
-typedef struct Mode Mode;
-struct Mode {
-	Mode *parent;                       /* if no match is found in this mode, search will continue there */
-	KeyBinding *bindings;               /* NULL terminated array of keybindings for this mode */
-	const char *name;                   /* descriptive, user facing name of the mode */
-	bool isuser;                        /* whether this is a user or internal mode */
-	bool common_prefix;                 /* whether the first key in this mode is always the same */
-	void (*enter)(Mode *old);           /* called right before the mode becomes active */
-	void (*leave)(Mode *new);           /* called right before the mode becomes inactive */
-	bool (*unknown)(KeyCombo);          /* called whenever a key combination is not found in this mode,
-	                                       the return value determines whether parent modes will be searched */
-	void (*input)(const char*, size_t); /* called whenever a key is not found in this mode and all its parent modes */
-	void (*idle)(void);                 /* called whenever a certain idle time i.e. without any user input elapsed */
-	time_t idle_timeout;                /* idle time in seconds after which the registered function will be called */
-	bool visual;                        /* whether text selection is possible in this mode */
-};
-
-typedef struct {
-	char *name;                    /* is used to match against argv[0] to enable this config */
-	Mode *mode;                    /* default mode in which the editor should start in */
-	bool (*keypress)(Key*);        /* called before any other keybindings are checked,
-	                                * return value decides whether key should be ignored */
-} Config;
-
-typedef struct {
-	int count;        /* how many times should the command be executed? */
-	Register *reg;    /* always non-NULL, set to a default register */
-	Filerange range;  /* which part of the file should be affected by the operator */
-	size_t pos;       /* at which byte from the start of the file should the operation start? */
-	bool linewise;    /* should the changes always affect whole lines? */
-	const Arg *arg;   /* arbitrary arguments */
-} OperatorContext;
-
-typedef struct {
-	void (*func)(OperatorContext*); /* function implementing the operator logic */
-} Operator;
-
-typedef struct {
-	size_t (*cmd)(const Arg*);        /* a custom movement based on user input from vis.c */
-	size_t (*win)(Win*);              /* a movement based on current window content from window.h */
-	size_t (*txt)(Text*, size_t pos); /* a movement form text-motions.h */
-	enum {
-		LINEWISE  = 1 << 0,
-		CHARWISE  = 1 << 1,
-		INCLUSIVE = 1 << 2,
-		EXCLUSIVE = 1 << 3,
-		IDEMPOTENT = 1 << 4,
-		JUMP = 1 << 5,
-	} type;
-	int count;
-} Movement;
-
-typedef struct {
-	Filerange (*range)(Text*, size_t pos); /* a text object from text-objects.h */
-	enum {
-		INNER,
-		OUTER,
-	} type;
-} TextObject;
-
-typedef struct {             /** collects all information until an operator is executed */
-	int count;
-	bool linewise;
-	const Operator *op;
-	const Movement *movement;
-	const TextObject *textobj;
-	Register *reg;
-	int mark;
-	Key key;
-	Arg arg;
-} Action;
-
-enum CmdOpt {          /* option flags for command definitions */
-	CMD_OPT_NONE,  /* no option (default value) */
-	CMD_OPT_FORCE, /* whether the command can be forced by appending '!' */
-	CMD_OPT_ARGS,  /* whether the command line should be parsed in to space
-	                * separated arguments to placed into argv, otherwise argv[1]
-	                * will contain the  remaining command line unmodified */
-};
-
-typedef struct {             /* command definitions for the ':'-prompt */
-	const char *name[3]; /* name and optional alias for the command */
-	/* command logic called with a NULL terminated array of arguments.
-	 * argv[0] will be the command name */
-	bool (*cmd)(Filerange*, enum CmdOpt opt, const char *argv[]);
-	enum CmdOpt opt;     /* command option flags */
-} Command;
-
 /** global variables */
-static volatile bool running = true; /* exit main loop once this becomes false */
-static volatile sig_atomic_t need_resize;
 static Editor *vis;         /* global editor instance, keeps track of all windows etc. */
-static Mode *mode;          /* currently active mode, used to search for keybindings */
-static Mode *mode_prev;     /* previsouly active user mode */
-static Mode *mode_before_prompt; /* user mode which was active before entering prompt */
-static Action action;       /* current action which is in progress */
-static Action action_prev;  /* last operator action used by the repeat '.' key */
-static Buffer buffer_repeat;/* repeat last modification i.e. insertion/replacement */
-static Map *cmdmap;         /* :-commands are stored here, used for prefix searches */
 
 /** operators */
 static void op_change(OperatorContext *c);
@@ -687,19 +568,20 @@ static void op_join(OperatorContext *c) {
 }
 
 static void op_repeat_insert(OperatorContext *c) {
-	if (!buffer_repeat.len)
+	size_t len = vis->buffer_repeat.len;
+	if (!len)
 		return;
-	editor_insert(vis, c->pos, buffer_repeat.data, buffer_repeat.len);
-	window_cursor_to(vis->win->win, c->pos + buffer_repeat.len);
+	editor_insert(vis, c->pos, vis->buffer_repeat.data, len);
+	window_cursor_to(vis->win->win, c->pos + len);
 }
 
 static void op_repeat_replace(OperatorContext *c) {
-	if (!buffer_repeat.len)
+	size_t chars = 0, len = vis->buffer_repeat.len;
+	if (!len)
 		return;
-
-	size_t chars = 0;
-	for (size_t i = 0; i < buffer_repeat.len; i++) {
-		if (ISUTF8(buffer_repeat.data[i]))
+	const char *data = vis->buffer_repeat.data;
+	for (size_t i = 0; i < len; i++) {
+		if (ISUTF8(data[i]))
 			chars++;
 	}
 
@@ -759,7 +641,7 @@ static void mark_set(const Arg *arg) {
 }
 
 static size_t mark_goto(const Arg *arg) {
-	return text_mark_get(vis->win->text->data, vis->win->text->marks[action.mark]);
+	return text_mark_get(vis->win->text->data, vis->win->text->marks[vis->action.mark]);
 }
 
 static size_t mark_line_goto(const Arg *arg) {
@@ -768,7 +650,7 @@ static size_t mark_line_goto(const Arg *arg) {
 
 static size_t to(const Arg *arg) {
 	return text_find_char_next(vis->win->text->data, window_cursor_get(vis->win->win) + 1,
-		action.key.str, strlen(action.key.str));
+		vis->action.key.str, strlen(vis->action.key.str));
 }
 
 static size_t till(const Arg *arg) {
@@ -777,7 +659,7 @@ static size_t till(const Arg *arg) {
 
 static size_t to_left(const Arg *arg) {
 	return text_find_char_prev(vis->win->text->data, window_cursor_get(vis->win->win) - 1,
-		action.key.str, strlen(action.key.str));
+		vis->action.key.str, strlen(vis->action.key.str));
 }
 
 static size_t till_left(const Arg *arg) {
@@ -785,16 +667,16 @@ static size_t till_left(const Arg *arg) {
 }
 
 static size_t line(const Arg *arg) {
-	return text_pos_by_lineno(vis->win->text->data, action.count);
+	return text_pos_by_lineno(vis->win->text->data, vis->action.count);
 }
 
 static size_t column(const Arg *arg) {
 	size_t pos = window_cursor_get(vis->win->win);
-	return text_line_offset(vis->win->text->data, pos, action.count);
+	return text_line_offset(vis->win->text->data, pos, vis->action.count);
 }
 
 static size_t window_lines_top(const Arg *arg) {
-	return window_screenline_goto(vis->win->win, action.count);
+	return window_screenline_goto(vis->win->win, vis->action.count);
 }
 
 static size_t window_lines_middle(const Arg *arg) {
@@ -804,7 +686,7 @@ static size_t window_lines_middle(const Arg *arg) {
 
 static size_t window_lines_bottom(const Arg *arg) {
 	int h = window_height_get(vis->win->win);
-	return window_screenline_goto(vis->win->win, h-action.count);
+	return window_screenline_goto(vis->win->win, h - vis->action.count);
 }
 
 /** key bindings functions of type: void (*func)(const Arg*) */
@@ -868,8 +750,8 @@ static void suspend(const Arg *arg) {
 }
 
 static void repeat(const Arg *arg) {
-	action = action_prev;
-	action_do(&action);
+	vis->action = vis->action_prev;
+	action_do(&vis->action);
 }
 
 static void replace(const Arg *arg) {
@@ -877,9 +759,9 @@ static void replace(const Arg *arg) {
 	if (!k.str[0])
 		return;
 	size_t pos = window_cursor_get(vis->win->win);
-	action_reset(&action_prev);
-	action_prev.op = &ops[OP_REPEAT_REPLACE];
-	buffer_put(&buffer_repeat, k.str, strlen(k.str));
+	action_reset(&vis->action_prev);
+	vis->action_prev.op = &ops[OP_REPEAT_REPLACE];
+	buffer_put(&vis->buffer_repeat, k.str, strlen(k.str));
 	editor_delete_key(vis);
 	editor_insert_key(vis, k.str, strlen(k.str));
 	text_snapshot(vis->win->text->data);
@@ -887,11 +769,11 @@ static void replace(const Arg *arg) {
 }
 
 static void count(const Arg *arg) {
-	action.count = action.count * 10 + arg->i;
+	vis->action.count = vis->action.count * 10 + arg->i;
 }
 
 static void gotoline(const Arg *arg) {
-	if (action.count)
+	if (vis->action.count)
 		movement(&(const Arg){ .i = MOVE_LINE });
 	else if (arg->i < 0)
 		movement(&(const Arg){ .i = MOVE_FILE_BEGIN });
@@ -900,27 +782,27 @@ static void gotoline(const Arg *arg) {
 }
 
 static void linewise(const Arg *arg) {
-	action.linewise = arg->b;
+	vis->action.linewise = arg->b;
 }
 
 static void operator(const Arg *arg) {
 	Operator *op = &ops[arg->i];
-	if (mode->visual) {
-		action.op = op;
-		action_do(&action);
+	if (vis->mode->visual) {
+		vis->action.op = op;
+		action_do(&vis->action);
 		return;
 	}
 	/* switch to operator mode inorder to make operator options and
 	 * text-object available */
 	switchmode(&(const Arg){ .i = VIS_MODE_OPERATOR });
-	if (action.op == op) {
+	if (vis->action.op == op) {
 		/* hacky way to handle double operators i.e. things like
 		 * dd, yy etc where the second char isn't a movement */
-		action.linewise = true;
-		action.textobj = moves_linewise[MOVE_SCREEN_LINE_DOWN];
-		action_do(&action);
+		vis->action.linewise = true;
+		vis->action.textobj = moves_linewise[MOVE_SCREEN_LINE_DOWN];
+		action_do(&vis->action);
 	} else {
-		action.op = op;
+		vis->action.op = op;
 	}
 }
 
@@ -930,40 +812,40 @@ static void operator_twice(const Arg *arg) {
 }
 
 static void changecase(const Arg *arg) {
-	action.arg = *arg;
+	vis->action.arg = *arg;
 	operator(&(const Arg){ .i = OP_CASE_CHANGE });
 }
 
 static void movement_key(const Arg *arg) {
 	Key k = getkey();
 	if (!k.str[0]) {
-		action_reset(&action);
+		action_reset(&vis->action);
 		return;
 	}
-	action.key = k;
-	action.movement = &moves[arg->i];
-	action_do(&action);
+	vis->action.key = k;
+	vis->action.movement = &moves[arg->i];
+	action_do(&vis->action);
 }
 
 static void movement(const Arg *arg) {
-	if (action.linewise && arg->i < LENGTH(moves_linewise))
-		action.textobj = moves_linewise[arg->i];
+	if (vis->action.linewise && arg->i < LENGTH(moves_linewise))
+		vis->action.textobj = moves_linewise[arg->i];
 	else
-		action.movement = &moves[arg->i];
+		vis->action.movement = &moves[arg->i];
 
-	if (action.op == &ops[OP_CHANGE]) {
-		if (action.movement == &moves[MOVE_WORD_START_NEXT])
-			action.movement = &moves[MOVE_WORD_END_NEXT];
-		else if (action.movement == &moves[MOVE_LONGWORD_START_NEXT])
-			action.movement = &moves[MOVE_LONGWORD_END_NEXT];
+	if (vis->action.op == &ops[OP_CHANGE]) {
+		if (vis->action.movement == &moves[MOVE_WORD_START_NEXT])
+			vis->action.movement = &moves[MOVE_WORD_END_NEXT];
+		else if (vis->action.movement == &moves[MOVE_LONGWORD_START_NEXT])
+			vis->action.movement = &moves[MOVE_LONGWORD_END_NEXT];
 	}
 
-	action_do(&action);
+	action_do(&vis->action);
 }
 
 static void textobj(const Arg *arg) {
-	action.textobj = &textobjs[arg->i];
-	action_do(&action);
+	vis->action.textobj = &textobjs[arg->i];
+	action_do(&vis->action);
 }
 
 static void selection_end(const Arg *arg) {
@@ -981,19 +863,19 @@ static void selection_end(const Arg *arg) {
 }
 
 static void reg(const Arg *arg) {
-	action.reg = &vis->registers[arg->i];
+	vis->action.reg = &vis->registers[arg->i];
 }
 
 static void mark(const Arg *arg) {
-	action.mark = arg->i;
-	action.movement = &moves[MOVE_MARK];
-	action_do(&action);
+	vis->action.mark = arg->i;
+	vis->action.movement = &moves[MOVE_MARK];
+	action_do(&vis->action);
 }
 
 static void mark_line(const Arg *arg) {
-	action.mark = arg->i;
-	action.movement = &moves[MOVE_MARK_LINE];
-	action_do(&action);
+	vis->action.mark = arg->i;
+	vis->action.movement = &moves[MOVE_MARK_LINE];
+	action_do(&vis->action);
 }
 
 static void undo(const Arg *arg) {
@@ -1015,7 +897,7 @@ static void redo(const Arg *arg) {
 }
 
 static void zero(const Arg *arg) {
-	if (action.count == 0)
+	if (vis->action.count == 0)
 		movement(&(const Arg){ .i = MOVE_LINE_BEGIN });
 	else
 		count(&(const Arg){ .i = 0 });
@@ -1060,8 +942,8 @@ static void prompt_enter(const Arg *arg) {
 	 * focused editor window *before* anything is executed which depends
 	 * on vis->win.
 	 */
-	switchmode_to(mode_before_prompt);
-	if (s && *s && exec_command(vis->prompt_type, s) && running)
+	switchmode_to(vis->mode_before_prompt);
+	if (s && *s && exec_command(vis->prompt_type, s) && vis->running)
 		switchmode(&(const Arg){ .i = VIS_MODE_NORMAL });
 	free(s);
 	editor_draw(vis);
@@ -1097,7 +979,7 @@ static void insert_verbatim(const Arg *arg) {
 }
 
 static void quit(const Arg *arg) {
-	running = false;
+	vis->running = false;
 }
 
 static void cmd(const Arg *arg) {
@@ -1113,8 +995,8 @@ static int argi2lines(const Arg *arg) {
 	case +PAGE_HALF:
 		return window_height_get(vis->win->win)/2;
 	default:
-		if (action.count > 0)
-			return action.count;
+		if (vis->action.count > 0)
+			return vis->action.count;
 		return arg->i < 0 ? -arg->i : arg->i;
 	}
 }
@@ -1174,9 +1056,9 @@ static void insert_newline(const Arg *arg) {
 }
 
 static void put(const Arg *arg) {
-	action.arg = *arg;
+	vis->action.arg = *arg;
 	operator(&(const Arg){ .i = OP_PUT });
-	action_do(&action);
+	action_do(&vis->action);
 }
 
 static void openline(const Arg *arg) {
@@ -1251,7 +1133,7 @@ static void action_do(Action *a) {
 			c.range.end = it.pos;
 		}
 	} else if (a->textobj) {
-		if (mode->visual)
+		if (vis->mode->visual)
 			c.range = window_selection_get(win);
 		else
 			c.range.start = c.range.end = pos;
@@ -1275,18 +1157,18 @@ static void action_do(Action *a) {
 			}
 		}
 
-		if (mode->visual) {
+		if (vis->mode->visual) {
 			window_selection_set(win, &c.range);
 			pos = c.range.end;
 			window_cursor_to(win, pos);
 		}
-	} else if (mode->visual) {
+	} else if (vis->mode->visual) {
 		c.range = window_selection_get(win);
 		if (!text_range_valid(&c.range))
 			c.range.start = c.range.end = pos;
 	}
 
-	if (mode == &vis_modes[VIS_MODE_VISUAL_LINE] && (a->movement || a->textobj)) {
+	if (vis->mode == &vis_modes[VIS_MODE_VISUAL_LINE] && (a->movement || a->textobj)) {
 		Filerange sel = window_selection_get(win);
 		sel.end = text_char_prev(txt, sel.end);
 		size_t start = text_line_begin(txt, sel.start);
@@ -1304,16 +1186,16 @@ static void action_do(Action *a) {
 
 	if (a->op) {
 		a->op->func(&c);
-		if (mode == &vis_modes[VIS_MODE_OPERATOR])
-			switchmode_to(mode_prev);
-		else if (mode->visual)
+		if (vis->mode == &vis_modes[VIS_MODE_OPERATOR])
+			switchmode_to(vis->mode_prev);
+		else if (vis->mode->visual)
 			switchmode(&(const Arg){ .i = VIS_MODE_NORMAL });
 		text_snapshot(txt);
 	}
 
-	if (a != &action_prev) {
+	if (a != &vis->action_prev) {
 		if (a->op)
-			action_prev = *a;
+			vis->action_prev = *a;
 		action_reset(a);
 	}
 }
@@ -1328,17 +1210,17 @@ static void action_reset(Action *a) {
 }
 
 static void switchmode_to(Mode *new_mode) {
-	if (mode == new_mode)
+	if (vis->mode == new_mode)
 		return;
-	if (mode->leave)
-		mode->leave(new_mode);
-	if (mode->isuser)
-		mode_prev = mode;
-	mode = new_mode;
-	if (mode == config->mode || (mode->name && mode->name[0] == '-'))
+	if (vis->mode->leave)
+		vis->mode->leave(new_mode);
+	if (vis->mode->isuser)
+		vis->mode_prev = vis->mode;
+	vis->mode = new_mode;
+	if (new_mode == config->mode || (new_mode->name && new_mode->name[0] == '-'))
 		vis->win->ui->draw_status(vis->win->ui);
-	if (mode->enter)
-		mode->enter(mode_prev);
+	if (new_mode->enter)
+		new_mode->enter(vis->mode_prev);
 }
 
 /** ':'-command implementations */
@@ -1370,6 +1252,7 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 			OPTION_TYPE_BOOL,
 			OPTION_TYPE_NUMBER,
 		} type;
+		bool optional;
 		int index;
 	} OptionDef;
 
@@ -1387,20 +1270,18 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 		[OPTION_AUTOINDENT]      = { { "autoindent", "ai"       }, OPTION_TYPE_BOOL   },
 		[OPTION_EXPANDTAB]       = { { "expandtab", "et"        }, OPTION_TYPE_BOOL   },
 		[OPTION_TABWIDTH]        = { { "tabwidth", "tw"         }, OPTION_TYPE_NUMBER },
-		[OPTION_SYNTAX]          = { { "syntax"                 }, OPTION_TYPE_STRING },
+		[OPTION_SYNTAX]          = { { "syntax"                 }, OPTION_TYPE_STRING, true },
 		[OPTION_NUMBER]          = { { "numbers", "nu"          }, OPTION_TYPE_BOOL   },
 		[OPTION_NUMBER_RELATIVE] = { { "relativenumbers", "rnu" }, OPTION_TYPE_BOOL   },
 	};
 
-	static Map *optmap = NULL;
-
-	if (!optmap) {
-		if (!(optmap = map_new()))
+	if (!vis->options) {
+		if (!(vis->options = map_new()))
 			return false;
 		for (int i = 0; i < LENGTH(options); i++) {
 			options[i].index = i;
 			for (const char **name = options[i].names; *name; name++) {
-				if (!map_put(optmap, *name, &options[i]))
+				if (!map_put(vis->options, *name, &options[i]))
 					return false;
 			}
 		}
@@ -1416,7 +1297,7 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 	OptionDef *opt = NULL;
 
 	if (!strncasecmp(argv[1], "no", 2)) {
-		opt = map_closest(optmap, argv[1]+2);
+		opt = map_closest(vis->options, argv[1]+2);
 		if (opt && opt->type == OPTION_TYPE_BOOL)
 			invert = true;
 		else
@@ -1424,7 +1305,7 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 	}
 
 	if (!opt)
-		opt = map_closest(optmap, argv[1]);
+		opt = map_closest(vis->options, argv[1]);
 	if (!opt) {
 		editor_info_show(vis, "Unknown option: `%s'", argv[1]);
 		return false;
@@ -1432,7 +1313,7 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 
 	switch (opt->type) {
 	case OPTION_TYPE_STRING:
-		if (!argv[2]) {
+		if (!opt->optional && !argv[2]) {
 			editor_info_show(vis, "Expecting string option value");
 			return false;
 		}
@@ -1468,6 +1349,15 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 		editor_tabwidth_set(vis, arg.i);
 		break;
 	case OPTION_SYNTAX:
+		if (!argv[2]) {
+			Syntax *syntax = window_syntax_get(vis->win->win);
+			if (syntax)
+				editor_info_show(vis, "Syntax definition in use: `%s'", syntax->name);
+			else
+				editor_info_show(vis, "No syntax definition in use");
+			return true;
+		}
+
 		for (Syntax *syntax = syntaxes; syntax && syntax->name; syntax++) {
 			if (!strcasecmp(syntax->name, argv[2])) {
 				window_syntax_set(vis->win->win, syntax);
@@ -1770,6 +1660,19 @@ static Filerange parse_range(char **cmd) {
 	return r;
 }
 
+static Command *lookup_cmd(const char *name) {
+	if (!vis->cmds) {
+		if (!(vis->cmds = map_new()))
+			return NULL;
+	
+		for (Command *cmd = cmds; cmd && cmd->name[0]; cmd++) {
+			for (const char **name = cmd->name; *name; name++)
+				map_put(vis->cmds, *name, cmd);
+		}
+	}
+	return map_closest(vis->cmds, name);
+}
+
 static bool exec_cmdline_command(const char *cmdline) {
 	enum CmdOpt opt = CMD_OPT_NONE;
 	char *line = strdup(cmdline);
@@ -1806,7 +1709,7 @@ static bool exec_cmdline_command(const char *cmdline) {
 	if (*param)
 		*param++ = '\0'; /* truncate by overwriting ' ' or '!' */
 
-	Command *cmd = map_closest(cmdmap, name);
+	Command *cmd = lookup_cmd(name);
 	if (!cmd) {
 		editor_info_show(vis, "Not an editor command");
 		free(line);
@@ -1850,7 +1753,7 @@ static bool exec_command(char type, const char *cmd) {
 	case '/':
 	case '?':
 		if (text_regex_compile(vis->search_pattern, cmd, REG_EXTENDED)) {
-			action_reset(&action);
+			action_reset(&vis->action);
 			return false;
 		}
 		movement(&(const Arg){ .i =
@@ -1905,19 +1808,6 @@ static void die(const char *errstr, ...) {
 	exit(EXIT_FAILURE);
 }
 
-static void sigwinch_handler(int sig) {
-	need_resize = true;
-}
-
-static void setup() {
-	struct sigaction sa;
-	sa.sa_flags = 0;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_handler = sigwinch_handler;
-	sigaction(SIGWINCH, &sa, NULL);
-	sigaction(SIGCONT, &sa, NULL);
-}
-
 static bool keymatch(Key *key0, Key *key1) {
 	return (key0->str[0] && memcmp(key0->str, key1->str, sizeof(key1->str)) == 0) ||
 	       (key0->code && key0->code == key1->code);
@@ -1954,7 +1844,7 @@ static void keypress(Key *key) {
 
 
 	keys[keylen++] = *key;
-	KeyBinding *action = keybinding(mode, keys);
+	KeyBinding *action = keybinding(vis->mode, keys);
 
 	if (action) {
 		int combolen = 0;
@@ -1968,8 +1858,8 @@ static void keypress(Key *key) {
 		memset(keys, 0, sizeof(keys));
 		if (action->func)
 			action->func(&action->arg);
-	} else if (keylen == 1 && key->code == 0 && mode->input) {
-		mode->input(key->str, strlen(key->str));
+	} else if (keylen == 1 && key->code == 0 && vis->mode->input) {
+		vis->mode->input(key->str, strlen(key->str));
 	}
 
 	keylen = 0;
@@ -2018,19 +1908,15 @@ static void mainloop() {
 	sigaddset(&blockset, SIGWINCH);
 	sigprocmask(SIG_BLOCK, &blockset, NULL);
 	editor_draw(vis);
+	vis->running = true;
 
-	while (running) {
-		if (need_resize) {
-			editor_resize(vis);
-			need_resize = false;
-		}
-
+	while (vis->running) {
 		fd_set fds;
 		FD_ZERO(&fds);
 		FD_SET(STDIN_FILENO, &fds);
 
 		editor_update(vis);
-		idle.tv_sec = mode->idle_timeout;
+		idle.tv_sec = vis->mode->idle_timeout;
 		int r = pselect(1, &fds, NULL, NULL, timeout, &emptyset);
 		if (r == -1 && errno == EINTR)
 			continue;
@@ -2041,8 +1927,8 @@ static void mainloop() {
 		}
 
 		if (!FD_ISSET(STDIN_FILENO, &fds)) {
-			if (mode->idle)
-				mode->idle();
+			if (vis->mode->idle)
+				vis->mode->idle();
 			timeout = NULL;
 			continue;
 		}
@@ -2050,26 +1936,11 @@ static void mainloop() {
 		Key key = getkey();
 		keypress(&key);
 
-		if (mode->idle)
+		if (vis->mode->idle)
 			timeout = &idle;
 	}
 }
 
-static bool vis_init(void) {
-	if (!(cmdmap = map_new()))
-		return false;
-	for (Command *cmd = cmds; cmd && cmd->name[0]; cmd++) {
-		for (const char **name = cmd->name; *name; name++) {
-			if (!map_put(cmdmap, *name, cmd))
-				return false;
-		}
-	}
-	return true;
-}
-
-static void vis_shutdown(void) {
-	map_free(cmdmap);
-}
 
 int main(int argc, char *argv[]) {
 	/* decide which key configuration to use based on argv[0] */
@@ -2083,11 +1954,11 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	mode_prev = mode = config->mode;
-	setup();
-
-	if (!vis_init() || !(vis = editor_new(ui_curses_new())))
+	if (!(vis = editor_new(ui_curses_new())))
 		die("Could not allocate editor core\n");
+
+	vis->mode_prev = vis->mode = config->mode;
+
 	if (!editor_syntax_load(vis, syntaxes, colors))
 		die("Could not load syntax highlighting definitions\n");
 
@@ -2128,6 +1999,5 @@ int main(int argc, char *argv[]) {
 	settings_apply(settings);
 	mainloop();
 	editor_free(vis);
-	vis_shutdown();
 	return 0;
 }
