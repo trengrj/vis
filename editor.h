@@ -16,7 +16,7 @@ typedef struct EditorWin EditorWin;
 #include "ring-buffer.h"
 #include "map.h"
 
-
+typedef struct VisText VisText;
 
 typedef union {
 	bool b;
@@ -81,6 +81,7 @@ typedef struct {
 	size_t (*cmd)(const Arg*);        /* a custom movement based on user input from vis.c */
 	size_t (*win)(Win*);              /* a movement based on current window content from window.h */
 	size_t (*txt)(Text*, size_t pos); /* a movement form text-motions.h */
+	size_t (*vistxt)(VisText*, size_t pos);
 	enum {
 		LINEWISE  = 1 << 0,
 		CHARWISE  = 1 << 1,
@@ -108,7 +109,6 @@ typedef struct {             /** collects all information until an operator is e
 	const TextObject *textobj;
 	Register *reg;
 	int mark;
-	Key key;
 	Arg arg;
 } Action;
 
@@ -191,9 +191,6 @@ enum Mark {
 	MARK_LAST,
 };
 
-
-typedef struct VisText VisText;
-
 struct VisText {
 	Text *data;
 	int refcount;
@@ -230,6 +227,8 @@ struct Editor {
 	EditorWin *prompt_window;         /* window which was focused before prompt was shown */
 	char prompt_type;                 /* command ':' or search '/','?' prompt */
 	Regex *search_pattern;            /* last used search pattern */
+	char search_char[8];              /* last used character to search for via 'f', 'F', 't', 'T' */
+	int last_totill;                  /* last to/till movement used for ';' and ',' */
 	int tabwidth;                     /* how many spaces should be used to display a tab */
 	bool expandtab;                   /* whether typed tabs should be converted to spaces */
 	bool autoindent;                  /* whether indentation should be copied from previous line on newline */
