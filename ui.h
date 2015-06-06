@@ -18,7 +18,7 @@ enum UiOption {
 #include <stdbool.h>
 #include <stdarg.h>
 #include "text.h"
-#include "window.h"
+#include "view.h"
 #include "editor.h"
 
 struct Ui {
@@ -26,10 +26,10 @@ struct Ui {
 	void (*free)(Ui*);
 	short (*color_get)(short fg, short bg);
 	void (*resize)(Ui*);
-	UiWin* (*window_new)(Ui*, Win*, Text*);
+	UiWin* (*window_new)(Ui*, View*, Text*);
 	void (*window_free)(UiWin*);
 	void (*window_focus)(UiWin*);
-	UiWin* (*prompt_new)(Ui*, Win*, Text*);
+	UiWin* (*prompt_new)(Ui*, View*, Text*);
 	void (*prompt)(Ui*, const char *title, const char *value);
 	char* (*prompt_input)(Ui*);
 	void (*prompt_hide)(Ui*);

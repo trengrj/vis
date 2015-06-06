@@ -57,7 +57,7 @@ static Command cmds[] = {
 	{ { "open"                     }, cmd_open,       CMD_OPT_NONE  },
 	{ { "qall"                     }, cmd_qall,       CMD_OPT_FORCE },
 	{ { "quit", "q"                }, cmd_quit,       CMD_OPT_FORCE },
-	{ { "read",                    }, cmd_read,       CMD_OPT_NONE  },
+	{ { "read",                    }, cmd_read,       CMD_OPT_FORCE },
 	{ { "saveas"                   }, cmd_saveas,     CMD_OPT_FORCE },
 	{ { "set",                     }, cmd_set,        CMD_OPT_ARGS  },
 	{ { "split"                    }, cmd_split,      CMD_OPT_NONE  },
@@ -67,6 +67,7 @@ static Command cmds[] = {
 	{ { "wq",                      }, cmd_wq,         CMD_OPT_FORCE },
 	{ { "write", "w"               }, cmd_write,      CMD_OPT_FORCE },
 	{ { "xit",                     }, cmd_xit,        CMD_OPT_FORCE },
+	{ { "!",                       }, cmd_filter,     CMD_OPT_NONE  },
 	{ /* array terminator */                                        },
 };
 
@@ -410,9 +411,9 @@ static KeyBinding vis_mode_normal[] = {
 	{ { NONE(';')               }, prompt_cmd,     { .s = ""                   } },
 	{ { NONE('Z'), NONE('Z')    }, cmd,            { .s = "wq"                 } },
 	{ { NONE('Z'), NONE('Q')    }, cmd,            { .s = "q!"                 } },
-	{ { NONE('z'), NONE('t')    }, window,         { .w = window_redraw_top    } },
-	{ { NONE('z'), NONE('z')    }, window,         { .w = window_redraw_center } },
-	{ { NONE('z'), NONE('b')    }, window,         { .w = window_redraw_bottom } },
+	{ { NONE('z'), NONE('t')    }, window,         { .w = view_redraw_top    } },
+	{ { NONE('z'), NONE('z')    }, window,         { .w = view_redraw_center } },
+	{ { NONE('z'), NONE('b')    }, window,         { .w = view_redraw_bottom } },
 	{ { NONE('q')               }, macro_record,   { NULL                      } },
 	{ { NONE('@')               }, macro_replay,   { NULL                      } },
 	{ /* empty last element, array terminator */                                 },
@@ -440,14 +441,14 @@ static KeyBinding vis_mode_visual[] = {
 
 static void vis_mode_visual_enter(Mode *old) {
 	if (!old->visual) {
-		window_selection_start(vis->win->win);
+		view_selection_start(vis->win->view);
 		vis_modes[VIS_MODE_OPERATOR].parent = &vis_modes[VIS_MODE_TEXTOBJ];
 	}
 }
 
 static void vis_mode_visual_leave(Mode *new) {
 	if (!new->visual) {
-		window_selection_clear(vis->win->win);
+		view_selection_clear(vis->win->view);
 		vis_modes[VIS_MODE_OPERATOR].parent = &vis_modes[VIS_MODE_MOVE];
 	}
 }
@@ -459,10 +460,10 @@ static KeyBinding vis_mode_visual_line[] = {
 };
 
 static void vis_mode_visual_line_enter(Mode *old) {
-	Win *win = vis->win->win;
-	window_cursor_to(win, text_line_begin(vis->win->text->data, window_cursor_get(win)));
+	View *view = vis->win->view;
+	view_cursor_to(view, text_line_begin(vis->win->file->text, view_cursor_get(view)));
 	if (!old->visual) {
-		window_selection_start(vis->win->win);
+		view_selection_start(view);
 		vis_modes[VIS_MODE_OPERATOR].parent = &vis_modes[VIS_MODE_TEXTOBJ];
 	}
 	movement(&(const Arg){ .i = MOVE_LINE_END });
@@ -470,10 +471,10 @@ static void vis_mode_visual_line_enter(Mode *old) {
 
 static void vis_mode_visual_line_leave(Mode *new) {
 	if (!new->visual) {
-		window_selection_clear(vis->win->win);
+		view_selection_clear(vis->win->view);
 		vis_modes[VIS_MODE_OPERATOR].parent = &vis_modes[VIS_MODE_MOVE];
 	} else {
-		window_cursor_to(vis->win->win, window_cursor_get(vis->win->win));
+		view_cursor_to(vis->win->view, view_cursor_get(vis->win->view));
 	}
 }
 
@@ -564,16 +565,16 @@ static KeyBinding vis_mode_insert[] = {
 
 static void vis_mode_insert_leave(Mode *old) {
 	/* make sure we can recover the current state after an editing operation */
-	text_snapshot(vis->win->text->data);
+	text_snapshot(vis->win->file->text);
 }
 
 static void vis_mode_insert_idle(void) {
-	text_snapshot(vis->win->text->data);
+	text_snapshot(vis->win->file->text);
 }
 
 static void vis_mode_insert_input(const char *str, size_t len) {
 	static size_t oldpos = EPOS;
-	size_t pos = window_cursor_get(vis->win->win);
+	size_t pos = view_cursor_get(vis->win->view);
 	if (pos != oldpos)
 		buffer_truncate(&vis->buffer_repeat);
 	buffer_append(&vis->buffer_repeat, str, len);
@@ -590,12 +591,12 @@ static KeyBinding vis_mode_replace[] = {
 
 static void vis_mode_replace_leave(Mode *old) {
 	/* make sure we can recover the current state after an editing operation */
-	text_snapshot(vis->win->text->data);
+	text_snapshot(vis->win->file->text);
 }
 
 static void vis_mode_replace_input(const char *str, size_t len) {
 	static size_t oldpos = EPOS;
-	size_t pos = window_cursor_get(vis->win->win);
+	size_t pos = view_cursor_get(vis->win->view);
 	if (pos != oldpos)
 		buffer_truncate(&vis->buffer_repeat);
 	buffer_append(&vis->buffer_repeat, str, len);

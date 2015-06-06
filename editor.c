@@ -6,18 +6,17 @@
 #include "editor.h"
 #include "util.h"
 
-static void vis_text_free(Editor *ed, VisText *text);
-static VisText *vis_text_new(Editor *ed, const char *filename);
-static EditorWin *editor_window_new_text(Editor *ed, VisText *text);
-static void editor_window_free(EditorWin *win);
+static void file_free(Editor *ed, File *file);
+static File *file_new(Editor *ed, const char *filename);
+static Win *window_new_file(Editor *ed, File *file);
+static void window_free(Win *win);
 static void editor_windows_invalidate(Editor *ed, size_t start, size_t end);
 
-
-static void editor_window_selection_changed(void *data, Filerange *sel) {
-	VisText *text = ((EditorWin*)data)->text;
+static void window_selection_changed(void *win, Filerange *sel) {
+	File *file = ((Win*)win)->file;
 	if (text_range_valid(sel)) {
-		text->marks[MARK_SELECTION_START] = text_mark_set(text->data, sel->start);
-		text->marks[MARK_SELECTION_END] = text_mark_set(text->data, sel->end);
+		file->marks[MARK_SELECTION_START] = text_mark_set(file->text, sel->start);
+		file->marks[MARK_SELECTION_END] = text_mark_set(file->text, sel->end);
 	}
 }
 
@@ -25,76 +24,76 @@ void editor_windows_arrange(Editor *ed, enum UiLayout layout) {
 	ed->ui->arrange(ed->ui, layout);
 }
 
-bool editor_window_reload(EditorWin *win) {
-	const char *filename = text_filename_get(win->text->data);
+bool editor_window_reload(Win *win) {
+	const char *filename = text_filename_get(win->file->text);
 	/* can't reload unsaved file */
 	if (!filename)
 		return false;
-	VisText *text = vis_text_new(win->editor, filename);
-	if (!text)
+	File *file = file_new(win->editor, filename);
+	if (!file)
 		return false;
-	vis_text_free(win->editor, win->text);
-	win->text = text;
-	window_reload(win->win, text->data);
+	file_free(win->editor, win->file);
+	win->file = file;
+	view_reload(win->view, file->text);
 	return true;
 }
 
-bool editor_window_split(EditorWin *original) {
-	EditorWin *win = editor_window_new_text(original->editor, original->text);
+bool editor_window_split(Win *original) {
+	Win *win = window_new_file(original->editor, original->file);
 	if (!win)
 		return false;
-	win->text = original->text;
-	win->text->refcount++;
-	window_syntax_set(win->win, window_syntax_get(original->win));
-	window_cursor_to(win->win, window_cursor_get(original->win));
+	win->file = original->file;
+	win->file->refcount++;
+	view_syntax_set(win->view, view_syntax_get(original->view));
+	view_cursor_to(win->view, view_cursor_get(original->view));
 	editor_draw(win->editor);
 	return true;
 }
 
-void editor_window_jumplist_add(EditorWin *win, size_t pos) {
-	Mark mark = text_mark_set(win->text->data, pos);
+void editor_window_jumplist_add(Win *win, size_t pos) {
+	Mark mark = text_mark_set(win->file->text, pos);
 	if (mark && win->jumplist)
 		ringbuf_add(win->jumplist, mark);
 }
 
-size_t editor_window_jumplist_prev(EditorWin *win) {
-	size_t cur = window_cursor_get(win->win);
+size_t editor_window_jumplist_prev(Win *win) {
+	size_t cur = view_cursor_get(win->view);
 	while (win->jumplist) {
 		Mark mark = ringbuf_prev(win->jumplist);
 		if (!mark)
 			return cur;
-		size_t pos = text_mark_get(win->text->data, mark);
+		size_t pos = text_mark_get(win->file->text, mark);
 		if (pos != EPOS && pos != cur)
 			return pos;
 	}
 	return cur;
 }
 
-size_t editor_window_jumplist_next(EditorWin *win) {
-	size_t cur = window_cursor_get(win->win);
+size_t editor_window_jumplist_next(Win *win) {
+	size_t cur = view_cursor_get(win->view);
 	while (win->jumplist) {
 		Mark mark = ringbuf_next(win->jumplist);
 		if (!mark)
 			return cur;
-		size_t pos = text_mark_get(win->text->data, mark);
+		size_t pos = text_mark_get(win->file->text, mark);
 		if (pos != EPOS && pos != cur)
 			return pos;
 	}
 	return cur;
 }
 
-void editor_window_jumplist_invalidate(EditorWin *win) {
+void editor_window_jumplist_invalidate(Win *win) {
 	if (win->jumplist)
 		ringbuf_invalidate(win->jumplist);
 }
 
-size_t editor_window_changelist_prev(EditorWin *win) {
-	size_t pos = window_cursor_get(win->win);
+size_t editor_window_changelist_prev(Win *win) {
+	size_t pos = view_cursor_get(win->view);
 	if (pos != win->changelist.pos)
 		win->changelist.index = 0;
 	else
 		win->changelist.index++;
-	size_t newpos = text_history_get(win->text->data, win->changelist.index);
+	size_t newpos = text_history_get(win->file->text, win->changelist.index);
 	if (newpos == EPOS)
 		win->changelist.index--;
 	else
@@ -102,13 +101,13 @@ size_t editor_window_changelist_prev(EditorWin *win) {
 	return win->changelist.pos;
 }
 
-size_t editor_window_changelist_next(EditorWin *win) {
-	size_t pos = window_cursor_get(win->win);
+size_t editor_window_changelist_next(Win *win) {
+	size_t pos = view_cursor_get(win->view);
 	if (pos != win->changelist.pos)
 		win->changelist.index = 0;
 	else if (win->changelist.index > 0)
 		win->changelist.index--;
-	size_t newpos = text_history_get(win->text->data, win->changelist.index);
+	size_t newpos = text_history_get(win->file->text, win->changelist.index);
 	if (newpos == EPOS)
 		win->changelist.index++;
 	else
@@ -121,7 +120,7 @@ void editor_resize(Editor *ed) {
 }
 
 void editor_window_next(Editor *ed) {
-	EditorWin *sel = ed->win;
+	Win *sel = ed->win;
 	if (!sel)
 		return;
 	ed->win = ed->win->next;
@@ -131,7 +130,7 @@ void editor_window_next(Editor *ed) {
 }
 
 void editor_window_prev(Editor *ed) {
-	EditorWin *sel = ed->win;
+	Win *sel = ed->win;
 	if (!sel)
 		return;
 	ed->win = ed->win->prev;
@@ -141,9 +140,9 @@ void editor_window_prev(Editor *ed) {
 }
 
 static void editor_windows_invalidate(Editor *ed, size_t start, size_t end) {
-	for (EditorWin *win = ed->windows; win; win = win->next) {
-		if (ed->win != win && ed->win->text == win->text) {
-			Filerange view = window_viewport_get(win->win);
+	for (Win *win = ed->windows; win; win = win->next) {
+		if (ed->win != win && ed->win->file == win->file) {
+			Filerange view = view_viewport_get(win->view);
 			if ((view.start <= start && start <= view.end) ||
 			    (view.start <= end && end <= view.end))
 				win->ui->draw(win->ui);
@@ -159,8 +158,8 @@ int editor_tabwidth_get(Editor *ed) {
 void editor_tabwidth_set(Editor *ed, int tabwidth) {
 	if (tabwidth < 1 || tabwidth > 8)
 		return;
-	for (EditorWin *win = ed->windows; win; win = win->next)
-		window_tabwidth_set(win->win, tabwidth);
+	for (Win *win = ed->windows; win; win = win->next)
+		view_tabwidth_set(win->view, tabwidth);
 	ed->tabwidth = tabwidth;
 }
 
@@ -218,35 +217,35 @@ void editor_suspend(Editor *ed) {
 	ed->ui->suspend(ed->ui);
 }
 
-static void editor_window_free(EditorWin *win) {
+static void window_free(Win *win) {
 	if (!win)
 		return;
 	Editor *ed = win->editor;
 	if (ed && ed->ui)
 		ed->ui->window_free(win->ui);
-	window_free(win->win);
+	view_free(win->view);
 	ringbuf_free(win->jumplist);
 	free(win);
 }
 
-static EditorWin *editor_window_new_text(Editor *ed, VisText *text) {
-	EditorWin *win = calloc(1, sizeof(EditorWin));
+static Win *window_new_file(Editor *ed, File *file) {
+	Win *win = calloc(1, sizeof(Win));
 	if (!win)
 		return NULL;
 	win->editor = ed;
-	win->text = text;
+	win->file = file;
 	win->events = (ViewEvent) {
 		.data = win,
-		.selection = editor_window_selection_changed,
+		.selection = window_selection_changed,
 	};
 	win->jumplist = ringbuf_alloc(31);
-	win->win = window_new(text->data, &win->events);
-	win->ui = ed->ui->window_new(ed->ui, win->win, text->data);
-	if (!win->jumplist || !win->win || !win->ui) {
-		editor_window_free(win);
+	win->view = view_new(file->text, &win->events);
+	win->ui = ed->ui->window_new(ed->ui, win->view, file->text);
+	if (!win->jumplist || !win->view || !win->ui) {
+		window_free(win);
 		return NULL;
 	}
-	window_tabwidth_set(win->win, ed->tabwidth);
+	view_tabwidth_set(win->view, ed->tabwidth);
 	if (ed->windows)
 		ed->windows->prev = win;
 	win->next = ed->windows;
@@ -256,80 +255,80 @@ static EditorWin *editor_window_new_text(Editor *ed, VisText *text) {
 	return win;
 }
 
-static void vis_text_free(Editor *ed, VisText *text) {
-	if (!text)
+static void file_free(Editor *ed, File *file) {
+	if (!file)
 		return;
-	if (--text->refcount > 0)
+	if (--file->refcount > 0)
 		return;
 	
-	text_free(text->data);
+	text_free(file->text);
 	
-	if (text->prev)
-		text->prev->next = text->next;
-	if (text->next)
-		text->next->prev = text->prev;
-	if (ed->texts == text)
-		ed->texts = text->next;
-	free(text);
+	if (file->prev)
+		file->prev->next = file->next;
+	if (file->next)
+		file->next->prev = file->prev;
+	if (ed->files == file)
+		ed->files = file->next;
+	free(file);
 }
 
-static VisText *vis_text_new_text(Editor *ed, Text *data) {
-	VisText *text = calloc(1, sizeof(*text));
-	if (!text)
+static File *file_new_text(Editor *ed, Text *text) {
+	File *file = calloc(1, sizeof(*file));
+	if (!file)
 		return NULL;
-	text->data = data;
-	text->refcount++;
-	if (ed->texts)
-		ed->texts->prev = text;
-	text->next = ed->texts;
-	ed->texts = text;
-	return text;
+	file->text = text;
+	file->refcount++;
+	if (ed->files)
+		ed->files->prev = file;
+	file->next = ed->files;
+	ed->files = file;
+	return file;
 }
 
-static VisText *vis_text_new(Editor *ed, const char *filename) {
+static File *file_new(Editor *ed, const char *filename) {
 	if (filename) {
 		/* try to detect whether the same file is already open in another window
 		 * TODO: do this based on inodes */
-		for (VisText *txt = ed->texts; txt; txt = txt->next) {
-			const char *f = text_filename_get(txt->data);
-			if (f && strcmp(f, filename) == 0) {
-				txt->refcount++;
-				return txt;
+		for (File *file = ed->files; file; file = file->next) {
+			const char *name = text_filename_get(file->text);
+			if (name && strcmp(name, filename) == 0) {
+				file->refcount++;
+				return file;
 			}
 		}
 	}
 
-	Text *data = text_load(filename);
-	if (!data && filename && errno == ENOENT)
-		data = text_load(NULL);
-	if (!data)
+	Text *text = text_load(filename);
+	if (!text && filename && errno == ENOENT)
+		text = text_load(NULL);
+	if (!text)
 		return NULL;
 	if (filename)
-		text_filename_set(data, filename);
+		text_filename_set(text, filename);
 	
-	VisText *text = vis_text_new_text(ed, data);
-	if (!text) {
-		text_free(data);
+	File *file = file_new_text(ed, text);
+	if (!file) {
+		text_free(text);
 		return NULL;
 	}
 
-	return text;
+	return file;
 }
 
 bool editor_window_new(Editor *ed, const char *filename) {
-	VisText *text = vis_text_new(ed, filename);
-	if (!text)
+	File *file = file_new(ed, filename);
+	if (!file)
 		return false;
-	EditorWin *win = editor_window_new_text(ed, text);
+	Win *win = window_new_file(ed, file);
 	if (!win) {
-		vis_text_free(ed, text);
+		file_free(ed, file);
 		return false;
 	}
 
 	if (filename) {
 		for (Syntax *syn = ed->syntaxes; syn && syn->name; syn++) {
 			if (!regexec(&syn->file_regex, filename, 0, NULL, 0)) {
-				window_syntax_set(win->win, syn);
+				view_syntax_set(win->view, syn);
 				break;
 			}
 		}
@@ -341,25 +340,25 @@ bool editor_window_new(Editor *ed, const char *filename) {
 }
 
 bool editor_window_new_fd(Editor *ed, int fd) {
-	Text *data = text_load_fd(fd);
-	if (!data)
+	Text *text = text_load_fd(fd);
+	if (!text)
 		return false;
-	VisText *text = vis_text_new_text(ed, data);
-	if (!text) {
-		vis_text_free(ed, text);
+	File *file = file_new_text(ed, text);
+	if (!file) {
+		file_free(ed, file);
 		return false;
 	}
-	EditorWin *win = editor_window_new_text(ed, text);
+	Win *win = window_new_file(ed, file);
 	if (!win) {
-		vis_text_free(ed, text);
+		file_free(ed, file);
 		return false;
 	}
 	return true;
 }
 
-void editor_window_close(EditorWin *win) {
+void editor_window_close(Win *win) {
 	Editor *ed = win->editor;
-	vis_text_free(ed, win->text);
+	file_free(ed, win->file);
 	if (win->prev)
 		win->prev->next = win->next;
 	if (win->next)
@@ -368,7 +367,7 @@ void editor_window_close(EditorWin *win) {
 		ed->windows = win->next;
 	if (ed->win == win)
 		ed->win = win->next ? win->next : win->prev;
-	editor_window_free(win);
+	window_free(win);
 	if (ed->win)
 		ed->ui->window_focus(ed->win->ui);
 	editor_draw(ed);
@@ -384,15 +383,15 @@ Editor *editor_new(Ui *ui) {
 	ed->ui->init(ed->ui, ed);
 	ed->tabwidth = 8;
 	ed->expandtab = false;
-	if (!(ed->prompt = calloc(1, sizeof(EditorWin))))
+	if (!(ed->prompt = calloc(1, sizeof(Win))))
 		goto err;
-	if (!(ed->prompt->text = calloc(1, sizeof(VisText))))
+	if (!(ed->prompt->file = calloc(1, sizeof(File))))
 		goto err;
-	if (!(ed->prompt->text->data = text_load(NULL)))
+	if (!(ed->prompt->file->text = text_load(NULL)))
 		goto err;
-	if (!(ed->prompt->win = window_new(ed->prompt->text->data, NULL)))
+	if (!(ed->prompt->view = view_new(ed->prompt->file->text, NULL)))
 		goto err;
-	if (!(ed->prompt->ui = ed->ui->prompt_new(ed->ui, ed->prompt->win, ed->prompt->text->data)))
+	if (!(ed->prompt->ui = ed->ui->prompt_new(ed->ui, ed->prompt->view, ed->prompt->file->text)))
 		goto err;
 	if (!(ed->search_pattern = text_regex_new()))
 		goto err;
@@ -407,52 +406,54 @@ void editor_free(Editor *ed) {
 		return;
 	while (ed->windows)
 		editor_window_close(ed->windows);
-	vis_text_free(ed, ed->prompt->text);
-	editor_window_free(ed->prompt);
+	file_free(ed, ed->prompt->file);
+	window_free(ed->prompt);
 	text_regex_free(ed->search_pattern);
 	for (int i = 0; i < REG_LAST; i++)
-		register_free(&ed->registers[i]);
+		register_release(&ed->registers[i]);
+	for (int i = 0; i < MACRO_LAST; i++)
+		macro_release(&ed->macros[i]);
 	editor_syntax_unload(ed);
 	ed->ui->free(ed->ui);
 	map_free(ed->cmds);
 	map_free(ed->options);
-	buffer_free(&ed->buffer_repeat);
+	buffer_release(&ed->buffer_repeat);
 	free(ed);
 }
 
 void editor_insert_key(Editor *ed, const char *c, size_t len) {
-	Win *win = ed->win->win;
-	size_t start = window_cursor_get(win);
-	window_insert_key(win, c, len);
+	View *view = ed->win->view;
+	size_t start = view_cursor_get(view);
+	view_insert_key(view, c, len);
 	editor_windows_invalidate(ed, start, start + len);
 }
 
 void editor_replace_key(Editor *ed, const char *c, size_t len) {
-	Win *win = ed->win->win;
-	size_t start = window_cursor_get(win);
-	window_replace_key(win, c, len);
+	View *view = ed->win->view;
+	size_t start = view_cursor_get(view);
+	view_replace_key(view, c, len);
 	editor_windows_invalidate(ed, start, start + 6);
 }
 
 void editor_backspace_key(Editor *ed) {
-	Win *win = ed->win->win;
-	size_t end = window_cursor_get(win);
-	size_t start = window_backspace_key(win);
+	View *view = ed->win->view;
+	size_t end = view_cursor_get(view);
+	size_t start = view_backspace_key(view);
 	editor_windows_invalidate(ed, start, end);
 }
 
 void editor_delete_key(Editor *ed) {
-	size_t start = window_delete_key(ed->win->win);
+	size_t start = view_delete_key(ed->win->view);
 	editor_windows_invalidate(ed, start, start + 6);
 }
 
 void editor_insert(Editor *ed, size_t pos, const char *c, size_t len) {
-	text_insert(ed->win->text->data, pos, c, len);
+	text_insert(ed->win->file->text, pos, c, len);
 	editor_windows_invalidate(ed, pos, pos + len);
 }
 
 void editor_delete(Editor *ed, size_t pos, size_t len) {
-	text_delete(ed->win->text->data, pos, len);
+	text_delete(ed->win->file->text, pos, len);
 	editor_windows_invalidate(ed, pos, pos + len);
 }
 
@@ -488,7 +489,7 @@ void editor_info_hide(Editor *ed) {
 	ed->ui->info_hide(ed->ui);
 }
 
-void editor_window_options(EditorWin *win, enum UiOption options) {
+void editor_window_options(Win *win, enum UiOption options) {
 	win->ui->options(win->ui, options);
 }
 

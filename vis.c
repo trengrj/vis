@@ -27,6 +27,7 @@
 #include <ctype.h>
 #include <sys/select.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -42,16 +43,16 @@
 static Editor *vis;         /* global editor instance, keeps track of all windows etc. */
 
 /** operators */
-static void op_change(OperatorContext *c);
-static void op_yank(OperatorContext *c);
-static void op_put(OperatorContext *c);
-static void op_delete(OperatorContext *c);
-static void op_shift_right(OperatorContext *c);
-static void op_shift_left(OperatorContext *c);
-static void op_case_change(OperatorContext *c);
-static void op_join(OperatorContext *c);
-static void op_repeat_insert(OperatorContext *c);
-static void op_repeat_replace(OperatorContext *c);
+static size_t op_change(OperatorContext *c);
+static size_t op_yank(OperatorContext *c);
+static size_t op_put(OperatorContext *c);
+static size_t op_delete(OperatorContext *c);
+static size_t op_shift_right(OperatorContext *c);
+static size_t op_shift_left(OperatorContext *c);
+static size_t op_case_change(OperatorContext *c);
+static size_t op_join(OperatorContext *c);
+static size_t op_repeat_insert(OperatorContext *c);
+static size_t op_repeat_replace(OperatorContext *c);
 
 /* these can be passed as int argument to operator(&(const Arg){ .i = OP_*}) */
 enum {
@@ -133,7 +134,7 @@ enum {
 	MOVE_WINDOW_LINE_BOTTOM,
 };
 
-/** movements which can be used besides the one in text-motions.h and window.h */
+/** movements which can be used besides the one in text-motions.h and view.h */
 
 /* search in forward direction for the word under the cursor */
 static size_t search_word_forward(Text *txt, size_t pos);
@@ -143,9 +144,9 @@ static size_t search_word_backward(Text *txt, size_t pos);
 static size_t search_forward(Text *txt, size_t pos);
 static size_t search_backward(Text *txt, size_t pos);
 /* goto action.mark */
-static size_t mark_goto(VisText *txt, size_t pos);
+static size_t mark_goto(File *txt, size_t pos);
 /* goto first non-blank char on line pointed by action.mark */
-static size_t mark_line_goto(VisText *txt, size_t pos);
+static size_t mark_line_goto(File *txt, size_t pos);
 /* goto to next occurence of action.key to the right */
 static size_t to(Text *txt, size_t pos);
 /* goto to position before next occurence of action.key to the right */
@@ -159,20 +160,20 @@ static size_t line(Text *txt, size_t pos);
 /* goto to byte action.count on current line */
 static size_t column(Text *txt, size_t pos);
 /* goto the action.count-th line from top of the focused window */
-static size_t window_lines_top(const Arg *arg);
+static size_t view_lines_top(const Arg *arg);
 /* goto the start of middle line of the focused window */
-static size_t window_lines_middle(const Arg *arg);
+static size_t view_lines_middle(const Arg *arg);
 /* goto the action.count-th line from bottom of the focused window */
-static size_t window_lines_bottom(const Arg *arg);
+static size_t view_lines_bottom(const Arg *arg);
 
 static Movement moves[] = {
-	[MOVE_LINE_UP]             = { .win = window_line_up                                       },
-	[MOVE_LINE_DOWN]           = { .win = window_line_down                                     },
-	[MOVE_SCREEN_LINE_UP]      = { .win = window_screenline_up                                 },
-	[MOVE_SCREEN_LINE_DOWN]    = { .win = window_screenline_down                               },
-	[MOVE_SCREEN_LINE_BEGIN]   = { .win = window_screenline_begin,  .type = CHARWISE           },
-	[MOVE_SCREEN_LINE_MIDDLE]  = { .win = window_screenline_middle, .type = CHARWISE           },
-	[MOVE_SCREEN_LINE_END]     = { .win = window_screenline_end,    .type = CHARWISE|INCLUSIVE },
+	[MOVE_LINE_UP]             = { .view = view_line_up                                       },
+	[MOVE_LINE_DOWN]           = { .view = view_line_down                                     },
+	[MOVE_SCREEN_LINE_UP]      = { .view = view_screenline_up                                 },
+	[MOVE_SCREEN_LINE_DOWN]    = { .view = view_screenline_down                               },
+	[MOVE_SCREEN_LINE_BEGIN]   = { .view = view_screenline_begin,  .type = CHARWISE           },
+	[MOVE_SCREEN_LINE_MIDDLE]  = { .view = view_screenline_middle, .type = CHARWISE           },
+	[MOVE_SCREEN_LINE_END]     = { .view = view_screenline_end,    .type = CHARWISE|INCLUSIVE },
 	[MOVE_LINE_PREV]           = { .txt = text_line_prev,           .type = LINEWISE           },
 	[MOVE_LINE_BEGIN]          = { .txt = text_line_begin,          .type = LINEWISE           },
 	[MOVE_LINE_START]          = { .txt = text_line_start,          .type = LINEWISE           },
@@ -182,8 +183,8 @@ static Movement moves[] = {
 	[MOVE_LINE_NEXT]           = { .txt = text_line_next,           .type = LINEWISE           },
 	[MOVE_LINE]                = { .txt = line,                     .type = LINEWISE|IDEMPOTENT|JUMP},
 	[MOVE_COLUMN]              = { .txt = column,                   .type = CHARWISE|IDEMPOTENT},
-	[MOVE_CHAR_PREV]           = { .win = window_char_prev                                     },
-	[MOVE_CHAR_NEXT]           = { .win = window_char_next                                     },
+	[MOVE_CHAR_PREV]           = { .view = view_char_prev                                     },
+	[MOVE_CHAR_NEXT]           = { .view = view_char_next                                     },
 	[MOVE_WORD_START_PREV]     = { .txt = text_word_start_prev,     .type = CHARWISE           },
 	[MOVE_WORD_START_NEXT]     = { .txt = text_word_start_next,     .type = CHARWISE           },
 	[MOVE_WORD_END_PREV]       = { .txt = text_word_end_prev,       .type = CHARWISE|INCLUSIVE },
@@ -203,15 +204,15 @@ static Movement moves[] = {
 	[MOVE_RIGHT_TO]            = { .txt = to,                       .type = LINEWISE|INCLUSIVE },
 	[MOVE_LEFT_TILL]           = { .txt = till_left,                .type = LINEWISE           },
 	[MOVE_RIGHT_TILL]          = { .txt = till,                     .type = LINEWISE|INCLUSIVE },
-	[MOVE_MARK]                = { .vistxt = mark_goto,             .type = LINEWISE|JUMP|IDEMPOTENT },
-	[MOVE_MARK_LINE]           = { .vistxt = mark_line_goto,        .type = LINEWISE|JUMP|IDEMPOTENT },
+	[MOVE_MARK]                = { .file = mark_goto,             .type = LINEWISE|JUMP|IDEMPOTENT },
+	[MOVE_MARK_LINE]           = { .file = mark_line_goto,        .type = LINEWISE|JUMP|IDEMPOTENT },
 	[MOVE_SEARCH_WORD_FORWARD] = { .txt = search_word_forward,      .type = LINEWISE|JUMP      },
 	[MOVE_SEARCH_WORD_BACKWARD]= { .txt = search_word_backward,     .type = LINEWISE|JUMP      },
 	[MOVE_SEARCH_FORWARD]      = { .txt = search_forward,           .type = LINEWISE|JUMP      },
 	[MOVE_SEARCH_BACKWARD]     = { .txt = search_backward,          .type = LINEWISE|JUMP      },
-	[MOVE_WINDOW_LINE_TOP]     = { .cmd = window_lines_top,         .type = LINEWISE|JUMP|IDEMPOTENT },
-	[MOVE_WINDOW_LINE_MIDDLE]  = { .cmd = window_lines_middle,      .type = LINEWISE|JUMP|IDEMPOTENT },
-	[MOVE_WINDOW_LINE_BOTTOM]  = { .cmd = window_lines_bottom,      .type = LINEWISE|JUMP|IDEMPOTENT },
+	[MOVE_WINDOW_LINE_TOP]     = { .cmd = view_lines_top,         .type = LINEWISE|JUMP|IDEMPOTENT },
+	[MOVE_WINDOW_LINE_MIDDLE]  = { .cmd = view_lines_middle,      .type = LINEWISE|JUMP|IDEMPOTENT },
+	[MOVE_WINDOW_LINE_BOTTOM]  = { .cmd = view_lines_bottom,      .type = LINEWISE|JUMP|IDEMPOTENT },
 };
 
 /* these can be passed as int argument to textobj(&(const Arg){ .i = TEXT_OBJ_* }) */
@@ -413,11 +414,13 @@ static bool cmd_write(Filerange*, enum CmdOpt, const char *argv[]);
  * associate the new name with the buffer. further :w commands
  * without arguments will write to the new filename */
 static bool cmd_saveas(Filerange*, enum CmdOpt, const char *argv[]);
+/* filter range through external program argv[1] */
+static bool cmd_filter(Filerange*, enum CmdOpt, const char *argv[]);
 
 static void action_reset(Action *a);
 static void switchmode_to(Mode *new_mode);
 static bool vis_window_new(const char *file);
-static bool vis_window_split(EditorWin *win);
+static bool vis_window_split(Win *win);
 
 #include "config.h"
 
@@ -428,27 +431,30 @@ static bool exec_command(char type, const char *cmdline);
 
 /** operator implementations of type: void (*op)(OperatorContext*) */
 
-static void op_delete(OperatorContext *c) {
+static size_t op_delete(OperatorContext *c) {
+	Text *txt = vis->win->file->text;
 	size_t len = c->range.end - c->range.start;
 	c->reg->linewise = c->linewise;
-	register_put(c->reg, vis->win->text->data, &c->range);
-	editor_delete(vis, c->range.start, len);
-	window_cursor_to(vis->win->win, c->range.start);
+	register_put(c->reg, txt, &c->range);
+	text_delete(txt, c->range.start, len);
+	return c->range.start;
 }
 
-static void op_change(OperatorContext *c) {
-	op_delete(c);
+static size_t op_change(OperatorContext *c) {
+	size_t pos = op_delete(c);
 	switchmode(&(const Arg){ .i = VIS_MODE_INSERT });
+	return pos;
 }
 
-static void op_yank(OperatorContext *c) {
+static size_t op_yank(OperatorContext *c) {
 	c->reg->linewise = c->linewise;
-	register_put(c->reg, vis->win->text->data, &c->range);
+	register_put(c->reg, vis->win->file->text, &c->range);
+	return c->pos;
 }
 
-static void op_put(OperatorContext *c) {
-	Text *txt = vis->win->text->data;
-	size_t pos = window_cursor_get(vis->win->win);
+static size_t op_put(OperatorContext *c) {
+	Text *txt = vis->win->file->text;
+	size_t pos = c->pos;
 	if (c->arg->i > 0) {
 		if (c->reg->linewise)
 			pos = text_line_next(txt, pos);
@@ -458,11 +464,11 @@ static void op_put(OperatorContext *c) {
 		if (c->reg->linewise)
 			pos = text_line_begin(txt, pos);
 	}
-	editor_insert(vis, pos, c->reg->data, c->reg->len);
+	text_insert(txt, pos, c->reg->data, c->reg->len);
 	if (c->reg->linewise)
-		window_cursor_to(vis->win->win, text_line_start(txt, pos));
+		return text_line_start(txt, pos);
 	else
-		window_cursor_to(vis->win->win, pos + c->reg->len);
+		return pos + c->reg->len;
 }
 
 static const char *expand_tab(void) {
@@ -475,8 +481,8 @@ static const char *expand_tab(void) {
 	return vis->expandtab ? spaces : "\t";
 }
 
-static void op_shift_right(OperatorContext *c) {
-	Text *txt = vis->win->text->data;
+static size_t op_shift_right(OperatorContext *c) {
+	Text *txt = vis->win->file->text;
 	size_t pos = text_line_begin(txt, c->range.end), prev_pos;
 	const char *tab = expand_tab();
 	size_t tablen = strlen(tab);
@@ -490,12 +496,12 @@ static void op_shift_right(OperatorContext *c) {
 		text_insert(txt, pos, tab, tablen);
 		pos = text_line_prev(txt, pos);
 	}  while (pos >= c->range.start && pos != prev_pos);
-	window_cursor_to(vis->win->win, c->pos + tablen);
-	editor_draw(vis);
+
+	return c->pos + tablen;
 }
 
-static void op_shift_left(OperatorContext *c) {
-	Text *txt = vis->win->text->data;
+static size_t op_shift_left(OperatorContext *c) {
+	Text *txt = vis->win->file->text;
 	size_t pos = text_line_begin(txt, c->range.end), prev_pos;
 	size_t tabwidth = editor_tabwidth_get(vis), tablen;
 
@@ -518,16 +524,17 @@ static void op_shift_left(OperatorContext *c) {
 		text_delete(txt, pos, tablen);
 		pos = text_line_prev(txt, pos);
 	}  while (pos >= c->range.start && pos != prev_pos);
-	window_cursor_to(vis->win->win, c->pos - tablen);
-	editor_draw(vis);
+
+	return c->pos - tablen;
 }
 
-static void op_case_change(OperatorContext *c) {
+static size_t op_case_change(OperatorContext *c) {
+	Text *txt = vis->win->file->text;
 	size_t len = c->range.end - c->range.start;
 	char *buf = malloc(len);
 	if (!buf)
-		return;
-	len = text_bytes_get(vis->win->text->data, c->range.start, len, buf);
+		return c->pos;
+	len = text_bytes_get(txt, c->range.start, len, buf);
 	size_t rem = len;
 	for (char *cur = buf; rem > 0; cur++, rem--) {
 		int ch = (unsigned char)*cur;
@@ -541,16 +548,16 @@ static void op_case_change(OperatorContext *c) {
 		}
 	}
 
-	text_delete(vis->win->text->data, c->range.start, len);
-	text_insert(vis->win->text->data, c->range.start, buf, len);
-	editor_draw(vis);
+	text_delete(txt, c->range.start, len);
+	text_insert(txt, c->range.start, buf, len);
 	free(buf);
+	return c->pos;
 }
 
-static void op_join(OperatorContext *c) {
-	Text *txt = vis->win->text->data;
+static size_t op_join(OperatorContext *c) {
+	Text *txt = vis->win->file->text;
 	size_t pos = text_line_begin(txt, c->range.end), prev_pos;
-	Filerange sel = window_selection_get(vis->win->win);
+	Filerange sel = view_selection_get(vis->win->view);
 	/* if a selection ends at the begin of a line, skip line break */
 	if (pos == c->range.end && text_range_valid(&sel))
 		pos = text_line_prev(txt, pos);
@@ -567,33 +574,33 @@ static void op_join(OperatorContext *c) {
 		}
 	} while (pos != prev_pos);
 
-	window_cursor_to(vis->win->win, c->range.start);
-	editor_draw(vis);
+	return c->range.start;
 }
 
-static void op_repeat_insert(OperatorContext *c) {
+static size_t op_repeat_insert(OperatorContext *c) {
 	size_t len = vis->buffer_repeat.len;
 	if (!len)
-		return;
-	editor_insert(vis, c->pos, vis->buffer_repeat.data, len);
-	window_cursor_to(vis->win->win, c->pos + len);
+		return c->pos;
+	text_insert(vis->win->file->text, c->pos, vis->buffer_repeat.data, len);
+	return c->pos + len;
 }
 
-static void op_repeat_replace(OperatorContext *c) {
+static size_t op_repeat_replace(OperatorContext *c) {
+	Text *txt = vis->win->file->text;
 	size_t chars = 0, len = vis->buffer_repeat.len;
 	if (!len)
-		return;
+		return c->pos;
 	const char *data = vis->buffer_repeat.data;
 	for (size_t i = 0; i < len; i++) {
 		if (ISUTF8(data[i]))
 			chars++;
 	}
 
-	Iterator it = text_iterator_get(vis->win->text->data, c->pos);
+	Iterator it = text_iterator_get(txt, c->pos);
 	while (chars-- > 0)
 		text_iterator_char_next(&it, NULL);
-	editor_delete(vis, c->pos, it.pos - c->pos);
-	op_repeat_insert(c);
+	text_delete(txt, c->pos, it.pos - c->pos);
+	return op_repeat_insert(c);
 }
 
 /** movement implementations of type: size_t (*move)(const Arg*) */
@@ -636,16 +643,16 @@ static size_t search_backward(Text *txt, size_t pos) {
 }
 
 static void mark_set(const Arg *arg) {
-	size_t pos = window_cursor_get(vis->win->win);
-	vis->win->text->marks[arg->i] = text_mark_set(vis->win->text->data, pos);
+	size_t pos = view_cursor_get(vis->win->view);
+	vis->win->file->marks[arg->i] = text_mark_set(vis->win->file->text, pos);
 }
 
-static size_t mark_goto(VisText *txt, size_t pos) {
-	return text_mark_get(txt->data, txt->marks[vis->action.mark]);
+static size_t mark_goto(File *txt, size_t pos) {
+	return text_mark_get(txt->text, txt->marks[vis->action.mark]);
 }
 
-static size_t mark_line_goto(VisText *txt, size_t pos) {
-	return text_line_start(txt->data, mark_goto(txt, pos));
+static size_t mark_line_goto(File *txt, size_t pos) {
+	return text_line_start(txt->text, mark_goto(txt, pos));
 }
 
 static size_t to(Text *txt, size_t pos) {
@@ -688,18 +695,18 @@ static size_t column(Text *txt, size_t pos) {
 	return text_line_offset(txt, pos, vis->action.count);
 }
 
-static size_t window_lines_top(const Arg *arg) {
-	return window_screenline_goto(vis->win->win, vis->action.count);
+static size_t view_lines_top(const Arg *arg) {
+	return view_screenline_goto(vis->win->view, vis->action.count);
 }
 
-static size_t window_lines_middle(const Arg *arg) {
-	int h = window_height_get(vis->win->win);
-	return window_screenline_goto(vis->win->win, h/2);
+static size_t view_lines_middle(const Arg *arg) {
+	int h = view_height_get(vis->win->view);
+	return view_screenline_goto(vis->win->view, h/2);
 }
 
-static size_t window_lines_bottom(const Arg *arg) {
-	int h = window_height_get(vis->win->win);
-	return window_screenline_goto(vis->win->win, h - vis->action.count);
+static size_t view_lines_bottom(const Arg *arg) {
+	int h = view_height_get(vis->win->view);
+	return view_screenline_goto(vis->win->view, h - vis->action.count);
 }
 
 /** key bindings functions of type: void (*func)(const Arg*) */
@@ -711,7 +718,7 @@ static void jumplist(const Arg *arg) {
 	else
 		pos = editor_window_jumplist_prev(vis->win);
 	if (pos != EPOS)
-		window_cursor_to(vis->win->win, pos);
+		view_cursor_to(vis->win->view, pos);
 }
 
 static void changelist(const Arg *arg) {
@@ -721,7 +728,7 @@ static void changelist(const Arg *arg) {
 	else
 		pos = editor_window_changelist_prev(vis->win);
 	if (pos != EPOS)
-		window_cursor_to(vis->win->win, pos);
+		view_cursor_to(vis->win->view, pos);
 }
 
 static Macro *key2macro(const Arg *arg) {
@@ -801,14 +808,14 @@ static void replace(const Arg *arg) {
 	Key k = getkey();
 	if (!k.str[0])
 		return;
-	size_t pos = window_cursor_get(vis->win->win);
+	size_t pos = view_cursor_get(vis->win->view);
 	action_reset(&vis->action_prev);
 	vis->action_prev.op = &ops[OP_REPEAT_REPLACE];
 	buffer_put(&vis->buffer_repeat, k.str, strlen(k.str));
 	editor_delete_key(vis);
 	editor_insert_key(vis, k.str, strlen(k.str));
-	text_snapshot(vis->win->text->data);
-	window_cursor_to(vis->win->win, pos);
+	text_snapshot(vis->win->file->text);
+	view_cursor_to(vis->win->view, pos);
 }
 
 static void count(const Arg *arg) {
@@ -893,17 +900,17 @@ static void textobj(const Arg *arg) {
 }
 
 static void selection_end(const Arg *arg) {
-	size_t pos = window_cursor_get(vis->win->win);
-	Filerange sel = window_selection_get(vis->win->win);
+	size_t pos = view_cursor_get(vis->win->view);
+	Filerange sel = view_selection_get(vis->win->view);
 	if (pos == sel.start) {
-		pos = text_char_prev(vis->win->text->data, sel.end);
+		pos = text_char_prev(vis->win->file->text, sel.end);
 	} else {
 		pos = sel.start;
-		sel.start = text_char_prev(vis->win->text->data, sel.end);
+		sel.start = text_char_prev(vis->win->file->text, sel.end);
 		sel.end = pos;
 	}
-	window_selection_set(vis->win->win, &sel);
-	window_cursor_to(vis->win->win, pos);
+	view_selection_set(vis->win->view, &sel);
+	view_cursor_to(vis->win->view, pos);
 }
 
 static void reg(const Arg *arg) {
@@ -923,18 +930,18 @@ static void mark_line(const Arg *arg) {
 }
 
 static void undo(const Arg *arg) {
-	size_t pos = text_undo(vis->win->text->data);
+	size_t pos = text_undo(vis->win->file->text);
 	if (pos != EPOS) {
-		window_cursor_to(vis->win->win, pos);
+		view_cursor_to(vis->win->view, pos);
 		/* redraw all windows in case some display the same file */
 		editor_draw(vis);
 	}
 }
 
 static void redo(const Arg *arg) {
-	size_t pos = text_redo(vis->win->text->data);
+	size_t pos = text_redo(vis->win->file->text);
 	if (pos != EPOS) {
-		window_cursor_to(vis->win->win, pos);
+		view_cursor_to(vis->win->view, pos);
 		/* redraw all windows in case some display the same file */
 		editor_draw(vis);
 	}
@@ -964,9 +971,9 @@ static void delete(const Arg *arg) {
 
 static void insert_register(const Arg *arg) {
 	Register *reg = &vis->registers[arg->i];
-	int pos = window_cursor_get(vis->win->win);
+	int pos = view_cursor_get(vis->win->view);
 	editor_insert(vis, pos, reg->data, reg->len);
-	window_cursor_to(vis->win->win, pos + reg->len);
+	view_cursor_to(vis->win->view, pos + reg->len);
 }
 
 static void prompt_search(const Arg *arg) {
@@ -1006,7 +1013,7 @@ static void prompt_backspace(const Arg *arg) {
 	if (!cmd || !*cmd)
 		prompt_enter(NULL);
 	else
-		window_backspace_key(vis->win->win);
+		view_backspace_key(vis->win->view);
 	free(cmd);
 }
 
@@ -1019,7 +1026,7 @@ static void insert_verbatim(const Arg *arg) {
 		value = value * 10 + k.str[0] - '0';
 	}
 	char v = value;
-	editor_insert(vis, window_cursor_get(vis->win->win), &v, 1);
+	editor_insert(vis, view_cursor_get(vis->win->view), &v, 1);
 }
 
 static void quit(const Arg *arg) {
@@ -1034,10 +1041,10 @@ static int argi2lines(const Arg *arg) {
 	switch (arg->i) {
 	case -PAGE:
 	case +PAGE:
-		return window_height_get(vis->win->win);
+		return view_height_get(vis->win->view);
 	case -PAGE_HALF:
 	case +PAGE_HALF:
-		return window_height_get(vis->win->win)/2;
+		return view_height_get(vis->win->view)/2;
 	default:
 		if (vis->action.count > 0)
 			return vis->action.count;
@@ -1047,16 +1054,16 @@ static int argi2lines(const Arg *arg) {
 
 static void wscroll(const Arg *arg) {
 	if (arg->i >= 0)
-		window_scroll_down(vis->win->win, argi2lines(arg));
+		view_scroll_down(vis->win->view, argi2lines(arg));
 	else
-		window_scroll_up(vis->win->win, argi2lines(arg));
+		view_scroll_up(vis->win->view, argi2lines(arg));
 }
 
 static void wslide(const Arg *arg) {
 	if (arg->i >= 0)
-		window_slide_down(vis->win->win, argi2lines(arg));
+		view_slide_down(vis->win->view, argi2lines(arg));
 	else
-		window_slide_up(vis->win->win, argi2lines(arg));
+		view_slide_up(vis->win->view, argi2lines(arg));
 }
 
 static void call(const Arg *arg) {
@@ -1064,7 +1071,7 @@ static void call(const Arg *arg) {
 }
 
 static void window(const Arg *arg) {
-	arg->w(vis->win->win);
+	arg->w(vis->win->view);
 }
 
 static void insert(const Arg *arg) {
@@ -1075,8 +1082,8 @@ static void insert_tab(const Arg *arg) {
 	insert(&(const Arg){ .s = expand_tab() });
 }
 
-static void copy_indent_from_previous_line(Win *win, Text *text) {
-	size_t pos = window_cursor_get(win);
+static void copy_indent_from_previous_line(View *view, Text *text) {
+	size_t pos = view_cursor_get(view);
 	size_t prev_line = text_line_prev(text, pos);
 	if (pos == prev_line)
 		return;
@@ -1092,11 +1099,20 @@ static void copy_indent_from_previous_line(Win *win, Text *text) {
 }
 
 static void insert_newline(const Arg *arg) {
-	insert(&(const Arg){ .s =
-	       text_newlines_crnl(vis->win->text->data) ? "\r\n" : "\n" });
+	const char *nl;
+	switch (text_newline_type(vis->win->file->text)) {
+	case TEXT_NEWLINE_CRNL:
+		nl = "\r\n";
+		break;
+	default:
+		nl = "\n";
+		break;
+	}
+
+	insert(&(const Arg){ .s = nl });
 
 	if (vis->autoindent)
-		copy_indent_from_previous_line(vis->win->win, vis->win->text->data);
+		copy_indent_from_previous_line(vis->win->view, vis->win->file->text);
 }
 
 static void put(const Arg *arg) {
@@ -1129,13 +1145,14 @@ static void switchmode(const Arg *arg) {
 /** action processing: execut the operator / movement / text object */
 
 static void action_do(Action *a) {
-	Text *txt = vis->win->text->data;
-	Win *win = vis->win->win;
-	size_t pos = window_cursor_get(win);
+	Text *txt = vis->win->file->text;
+	View *view = vis->win->view;
+	size_t pos = view_cursor_get(view);
 	int count = MAX(1, a->count);
 	OperatorContext c = {
 		.count = a->count,
 		.pos = pos,
+		.range = text_range_empty(),
 		.reg = a->reg ? a->reg : &vis->registers[REG_DEFAULT],
 		.linewise = a->linewise,
 		.arg = &a->arg,
@@ -1146,10 +1163,10 @@ static void action_do(Action *a) {
 		for (int i = 0; i < count; i++) {
 			if (a->movement->txt)
 				pos = a->movement->txt(txt, pos);
-			else if (a->movement->win)
-				pos = a->movement->win(win);
-			else if (a->movement->vistxt)
-				pos = a->movement->vistxt(vis->win->text, pos);
+			else if (a->movement->view)
+				pos = a->movement->view(view);
+			else if (a->movement->file)
+				pos = a->movement->file(vis->win->file, pos);
 			else
 				pos = a->movement->cmd(&a->arg);
 			if (pos == EPOS || a->movement->type & IDEMPOTENT)
@@ -1167,9 +1184,9 @@ static void action_do(Action *a) {
 
 		if (!a->op) {
 			if (a->movement->type & CHARWISE)
-				window_scroll_to(win, pos);
+				view_scroll_to(view, pos);
 			else
-				window_cursor_to(win, pos);
+				view_cursor_to(view, pos);
 			if (a->movement->type & JUMP)
 				editor_window_jumplist_add(vis->win, pos);
 			else
@@ -1181,7 +1198,7 @@ static void action_do(Action *a) {
 		}
 	} else if (a->textobj) {
 		if (vis->mode->visual)
-			c.range = window_selection_get(win);
+			c.range = view_selection_get(view);
 		else
 			c.range.start = c.range.end = pos;
 		for (int i = 0; i < count; i++) {
@@ -1205,18 +1222,18 @@ static void action_do(Action *a) {
 		}
 
 		if (vis->mode->visual) {
-			window_selection_set(win, &c.range);
+			view_selection_set(view, &c.range);
 			pos = c.range.end;
-			window_cursor_to(win, pos);
+			view_cursor_to(view, pos);
 		}
 	} else if (vis->mode->visual) {
-		c.range = window_selection_get(win);
+		c.range = view_selection_get(view);
 		if (!text_range_valid(&c.range))
 			c.range.start = c.range.end = pos;
 	}
 
 	if (vis->mode == &vis_modes[VIS_MODE_VISUAL_LINE] && (a->movement || a->textobj)) {
-		Filerange sel = window_selection_get(win);
+		Filerange sel = view_selection_get(view);
 		sel.end = text_char_prev(txt, sel.end);
 		size_t start = text_line_begin(txt, sel.start);
 		size_t end = text_line_end(txt, sel.end);
@@ -1227,12 +1244,14 @@ static void action_do(Action *a) {
 			sel.start = start;
 			sel.end = end;
 		}
-		window_selection_set(win, &sel);
+		view_selection_set(view, &sel);
 		c.range = sel;
 	}
 
 	if (a->op) {
-		a->op->func(&c);
+		view_cursor_to(view, a->op->func(&c));
+		editor_draw(vis);
+
 		if (vis->mode == &vis_modes[VIS_MODE_OPERATOR])
 			switchmode_to(vis->mode_prev);
 		else if (vis->mode->visual)
@@ -1397,7 +1416,7 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 		break;
 	case OPTION_SYNTAX:
 		if (!argv[2]) {
-			Syntax *syntax = window_syntax_get(vis->win->win);
+			Syntax *syntax = view_syntax_get(vis->win->view);
 			if (syntax)
 				editor_info_show(vis, "Syntax definition in use: `%s'", syntax->name);
 			else
@@ -1407,13 +1426,13 @@ static bool cmd_set(Filerange *range, enum CmdOpt cmdopt, const char *argv[]) {
 
 		for (Syntax *syntax = syntaxes; syntax && syntax->name; syntax++) {
 			if (!strcasecmp(syntax->name, argv[2])) {
-				window_syntax_set(vis->win->win, syntax);
+				view_syntax_set(vis->win->view, syntax);
 				return true;
 			}
 		}
 
 		if (parse_bool(argv[2], &arg.b) && !arg.b)
-			window_syntax_set(vis->win->win, NULL);
+			view_syntax_set(vis->win->view, NULL);
 		else
 			editor_info_show(vis, "Unknown syntax definition: `%s'", argv[2]);
 		break;
@@ -1444,10 +1463,10 @@ static bool cmd_open(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 	return true;
 }
 
-static bool is_window_closeable(EditorWin *win) {
-	if (!text_modified(win->text->data))
+static bool is_view_closeable(Win *win) {
+	if (!text_modified(win->file->text))
 		return true;
-	return win->text->refcount > 1;
+	return win->file->refcount > 1;
 }
 
 static void info_unsaved_changes(void) {
@@ -1455,8 +1474,8 @@ static void info_unsaved_changes(void) {
 }
 
 static bool cmd_edit(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	EditorWin *oldwin = vis->win;
-	if (!(opt & CMD_OPT_FORCE) && !is_window_closeable(oldwin)) {
+	Win *oldwin = vis->win;
+	if (!(opt & CMD_OPT_FORCE) && !is_view_closeable(oldwin)) {
 		info_unsaved_changes();
 		return false;
 	}
@@ -1469,7 +1488,7 @@ static bool cmd_edit(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 }
 
 static bool cmd_quit(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	if (!(opt & CMD_OPT_FORCE) && !is_window_closeable(vis->win)) {
+	if (!(opt & CMD_OPT_FORCE) && !is_view_closeable(vis->win)) {
 		info_unsaved_changes();
 		return false;
 	}
@@ -1480,7 +1499,7 @@ static bool cmd_quit(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 }
 
 static bool cmd_xit(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	if (text_modified(vis->win->text->data) && !cmd_write(range, opt, argv)) {
+	if (text_modified(vis->win->file->text) && !cmd_write(range, opt, argv)) {
 		if (!(opt & CMD_OPT_FORCE))
 			return false;
 	}
@@ -1488,14 +1507,14 @@ static bool cmd_xit(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 }
 
 static bool cmd_bdelete(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	Text *txt = vis->win->text->data;
+	Text *txt = vis->win->file->text;
 	if (text_modified(txt) && !(opt & CMD_OPT_FORCE)) {
 		info_unsaved_changes();
 		return false;
 	}
-	for (EditorWin *next, *win = vis->windows; win; win = next) {
+	for (Win *next, *win = vis->windows; win; win = next) {
 		next = win->next;
-		if (win->text->data == txt)
+		if (win->file->text == txt)
 			editor_window_close(win);
 	}
 	if (!vis->windows)
@@ -1504,9 +1523,9 @@ static bool cmd_bdelete(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 }
 
 static bool cmd_qall(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	for (EditorWin *next, *win = vis->windows; win; win = next) {
+	for (Win *next, *win = vis->windows; win; win = next) {
 		next = win->next;
-		if (!text_modified(vis->win->text->data) || (opt & CMD_OPT_FORCE))
+		if (!text_modified(vis->win->file->text) || (opt & CMD_OPT_FORCE))
 			editor_window_close(win);
 	}
 	if (!vis->windows)
@@ -1517,37 +1536,35 @@ static bool cmd_qall(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 }
 
 static bool cmd_read(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	size_t pos = window_cursor_get(vis->win->win);
-	for (const char **file = &argv[1]; *file; file++) {
-		int fd = open(*file, O_RDONLY);
-		char *data = NULL;
-		struct stat info;
-		if (fd == -1)
-			goto err;
-		if (fstat(fd, &info) == -1)
-			goto err;
-		if (!S_ISREG(info.st_mode))
-			goto err;
-		// XXX: use lseek(fd, 0, SEEK_END); instead?
-		data = mmap(NULL, info.st_size, PROT_READ, MAP_SHARED, fd, 0);
-		if (data == MAP_FAILED)
-			goto err;
+	char cmd[255];
 
-		text_insert(vis->win->text->data, pos, data, info.st_size);
-		pos += info.st_size;
-	err:
-		if (fd != -1)
-			close(fd);
-		if (data && data != MAP_FAILED)
-			munmap(data, info.st_size);
+	if (!argv[1]) {
+		editor_info_show(vis, "Filename or command expected");
+		return false;
 	}
-	editor_draw(vis);
-	return true;
+
+	bool iscmd = (opt & CMD_OPT_FORCE) || argv[1][0] == '!';
+	const char *arg = argv[1]+(argv[1][0] == '!');
+	snprintf(cmd, sizeof cmd, "%s%s", iscmd ? "" : "cat ", arg);
+
+	size_t pos = view_cursor_get(vis->win->view);
+	if (!text_range_valid(range))
+		range = &(Filerange){ .start = pos, .end = pos };
+	Filerange delete = *range;
+	range->start = range->end;
+
+	bool ret = cmd_filter(range, opt, (const char*[]){ argv[0], "sh", "-c", cmd, NULL});
+	if (ret)
+		text_delete(vis->win->file->text, delete.start, delete.end - delete.start);
+	return ret;
 }
 
 static bool cmd_substitute(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	// TODO
-	return true;
+	char pattern[255];
+	if (!text_range_valid(range))
+		range = &(Filerange){ .start = 0, .end = text_size(vis->win->file->text) };
+	snprintf(pattern, sizeof pattern, "s%s", argv[1]);
+	return cmd_filter(range, opt, (const char*[]){ argv[0], "sed", pattern, NULL});
 }
 
 static bool openfiles(const char **files) {
@@ -1593,7 +1610,9 @@ static bool cmd_wq(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 }
 
 static bool cmd_write(Filerange *range, enum CmdOpt opt, const char *argv[]) {
-	Text *text = vis->win->text->data;
+	Text *text = vis->win->file->text;
+	if (!text_range_valid(range))
+		range = &(Filerange){ .start = 0, .end = text_size(text) };
 	if (!argv[1])
 		argv[1] = text_filename_get(text);
 	if (!argv[1]) {
@@ -1617,20 +1636,232 @@ static bool cmd_write(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 
 static bool cmd_saveas(Filerange *range, enum CmdOpt opt, const char *argv[]) {
 	if (cmd_write(range, opt, argv)) {
-		text_filename_set(vis->win->text->data, argv[1]);
+		text_filename_set(vis->win->file->text, argv[1]);
 		return true;
 	}
 	return false;
 }
 
+static void cancel_filter(int sig) {
+	vis->cancel_filter = true;
+}
+
+static bool cmd_filter(Filerange *range, enum CmdOpt opt, const char *argv[]) {
+	/* if an invalid range was given, stdin (i.e. key board input) is passed
+	 * through the external command. */
+	Text *text = vis->win->file->text;
+	View *view = vis->win->view;
+	int pin[2], pout[2], perr[2], status = -1;
+	bool interactive = !text_range_valid(range);
+	size_t pos = view_cursor_get(view);
+
+	if (pipe(pin) == -1)
+		return false;
+	if (pipe(pout) == -1) {
+		close(pin[0]);
+		close(pin[1]);
+		return false;
+	}
+
+	if (pipe(perr) == -1) {
+		close(pin[0]);
+		close(pin[1]);
+		close(pout[0]);
+		close(pout[1]);
+		return false;
+	}
+
+	reset_shell_mode();
+	pid_t pid = fork();
+
+	if (pid == -1) {
+		close(pin[0]);
+		close(pin[1]);
+		close(pout[0]);
+		close(pout[1]);
+		close(perr[0]);
+		close(perr[1]);
+		editor_info_show(vis, "fork failure: %s", strerror(errno));
+		return false;
+	} else if (pid == 0) { /* child i.e filter */
+		if (!interactive)
+			dup2(pin[0], STDIN_FILENO);
+		close(pin[0]);
+		close(pin[1]);
+		dup2(pout[1], STDOUT_FILENO);
+		close(pout[1]);
+		close(pout[0]);
+		if (!interactive)
+			dup2(perr[1], STDERR_FILENO);
+		close(perr[0]);
+		close(perr[1]);
+		if (!argv[2])
+			execl("/bin/sh", "sh", "-c", argv[1], NULL);
+		else
+			execvp(argv[1], (char**)argv+1);
+		editor_info_show(vis, "exec failure: %s", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	/* set up a signal handler to cancel the filter via CTRL-C */
+	struct sigaction sa, oldsa;
+	sa.sa_flags = 0;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_handler = cancel_filter;
+
+	bool restore_signals = sigaction(SIGINT, &sa, &oldsa) == 0;
+	vis->cancel_filter = false;
+
+	close(pin[0]);
+	close(pout[1]);
+	close(perr[1]);
+
+	fcntl(pout[0], F_SETFL, O_NONBLOCK);
+	fcntl(perr[0], F_SETFL, O_NONBLOCK);
+
+	if (interactive)
+		range = &(Filerange){ .start = pos, .end = pos };
+
+	/* ranges which are written to the filter and read back in */
+	Filerange rout = *range;
+	Filerange rin = (Filerange){ .start = range->end, .end = range->end };
+
+	/* The general idea is the following:
+	 *
+	 *  1) take a snapshot
+	 *  2) write [range.start, range.end] to exteneral command
+	 *  3) read the output of the external command and insert it after the range
+	 *  4) depending on the exit status of the external command
+	 *     - on success: delete original range
+	 *     - on failure: revert to previous snapshot
+	 *
+	 *  2) and 3) happend in small junks
+	 */
+
+	text_snapshot(text);
+
+	fd_set rfds, wfds;
+	Buffer errmsg;
+	buffer_init(&errmsg);
+
+	do {
+		if (vis->cancel_filter) {
+			kill(-pid, SIGTERM);
+			editor_info_show(vis, "Command cancelled");
+			break;
+		}
+
+		FD_ZERO(&rfds);
+		FD_ZERO(&wfds);
+		if (pin[1] != -1)
+			FD_SET(pin[1], &wfds);
+		if (pout[0] != -1)
+			FD_SET(pout[0], &rfds);
+		if (perr[0] != -1)
+			FD_SET(perr[0], &rfds);
+
+		if (select(FD_SETSIZE, &rfds, &wfds, NULL, NULL) == -1) {
+			if (errno == EINTR)
+				continue;
+			editor_info_show(vis, "Select failure");
+			break;
+		}
+
+		if (FD_ISSET(pin[1], &wfds)) {
+			Filerange junk = *range;
+			if (junk.end > junk.start + PIPE_BUF)
+				junk.end = junk.start + PIPE_BUF;
+			ssize_t len = text_range_write(text, &junk, pin[1]);
+			if (len > 0) {
+				range->start += len;
+				if (text_range_size(range) == 0) {
+					close(pout[1]);
+					pout[1] = -1;
+				}
+			} else {
+				close(pin[1]);
+				pin[1] = -1;
+				if (len == -1)
+					editor_info_show(vis, "Error writing to external command");
+			}
+		}
+
+		if (FD_ISSET(pout[0], &rfds)) {
+			char buf[BUFSIZ];
+			ssize_t len = read(pout[0], buf, sizeof buf);
+			if (len > 0) {
+				text_insert(text, rin.end, buf, len);
+				rin.end += len;
+			} else if (len == 0) {
+				close(pout[0]);
+				pout[0] = -1;
+			} else if (errno != EINTR && errno != EWOULDBLOCK) {
+				editor_info_show(vis, "Error reading from filter stdout");
+				close(pout[0]);
+				pout[0] = -1;
+			}
+		}
+
+		if (FD_ISSET(perr[0], &rfds)) {
+			char buf[BUFSIZ];
+			ssize_t len = read(perr[0], buf, sizeof buf);
+			if (len > 0) {
+				buffer_append(&errmsg, buf, len);
+			} else if (len == 0) {
+				close(perr[0]);
+				perr[0] = -1;
+			} else if (errno != EINTR && errno != EWOULDBLOCK) {
+				editor_info_show(vis, "Error reading from filter stderr");
+				close(pout[0]);
+				pout[0] = -1;
+			}
+		}
+
+	} while (pin[1] != -1 || pout[0] != -1 || perr[0] != -1);
+
+	if (pin[1] != -1)
+		close(pin[1]);
+	if (pout[0] != -1)
+		close(pout[0]);
+	if (perr[0] != -1)
+		close(perr[0]);
+
+	if (waitpid(pid, &status, 0) == pid && status == 0) {
+		text_delete(text, rout.start, rout.end - rout.start);
+		text_snapshot(text);
+	} else {
+		/* make sure we have somehting to undo */
+		text_insert(text, pos, " ", 1);
+		text_undo(text);
+	}
+
+	view_cursor_to(view, rout.start);
+
+	if (!vis->cancel_filter) {
+		if (status == 0)
+			editor_info_show(vis, "Command succeded");
+		else if (errmsg.len > 0)
+			editor_info_show(vis, "Command failed: %s", errmsg.data);
+		else
+			editor_info_show(vis, "Command failed");
+	}
+
+	if (restore_signals)
+		sigaction(SIGTERM, &oldsa, NULL);
+
+	reset_prog_mode();
+	wclear(stdscr);
+	return status == 0;
+}
+
 static Filepos parse_pos(char **cmd) {
 	size_t pos = EPOS;
-	Win *win = vis->win->win;
-	Text *txt = vis->win->text->data;
-	Mark *marks = vis->win->text->marks;
+	View *view = vis->win->view;
+	Text *txt = vis->win->file->text;
+	Mark *marks = vis->win->file->marks;
 	switch (**cmd) {
 	case '.':
-		pos = text_line_begin(txt, window_cursor_get(win));
+		pos = text_line_begin(txt, view_cursor_get(view));
 		(*cmd)++;
 		break;
 	case '$':
@@ -1658,14 +1889,14 @@ static Filepos parse_pos(char **cmd) {
 			return EPOS;
 		if (!text_regex_compile(regex, *cmd, 0)) {
 			*cmd = pattern_end;
-			pos = text_search_forward(txt, window_cursor_get(win), regex);
+			pos = text_search_forward(txt, view_cursor_get(view), regex);
 		}
 		text_regex_free(regex);
 		break;
 	case '+':
 	case '-':
 	{
-		CursorPos curspos = window_cursor_getpos(win);
+		CursorPos curspos = view_cursor_getpos(view);
 		long long line = curspos.line + strtoll(*cmd, cmd, 10);
 		if (line < 0)
 			line = 0;
@@ -1682,9 +1913,10 @@ static Filepos parse_pos(char **cmd) {
 }
 
 static Filerange parse_range(char **cmd) {
-	Text *txt = vis->win->text->data;
+	Text *txt = vis->win->file->text;
 	Filerange r = text_range_empty();
-	Mark *marks = vis->win->text->marks;
+	Mark *marks = vis->win->file->marks;
+	char start = **cmd;
 	switch (**cmd) {
 	case '%':
 		r.start = 0;
@@ -1698,8 +1930,11 @@ static Filerange parse_range(char **cmd) {
 		break;
 	default:
 		r.start = parse_pos(cmd);
-		if (**cmd != ',')
+		if (**cmd != ',') {
+			if (start == '.')
+				r.end = text_line_next(txt, r.start);
 			return r;
+		}
 		(*cmd)++;
 		r.end = parse_pos(cmd);
 		break;
@@ -1722,15 +1957,18 @@ static Command *lookup_cmd(const char *name) {
 
 static bool exec_cmdline_command(const char *cmdline) {
 	enum CmdOpt opt = CMD_OPT_NONE;
-	char *line = strdup(cmdline);
-	char *name = line;
+	size_t len = strlen(cmdline);
+	char *line = malloc(len+2);
 	if (!line)
 		return false;
+	line = strncpy(line, cmdline, len+1);
+	char *name = line;
+
 	Filerange range = parse_range(&name);
 	if (!text_range_valid(&range)) {
 		/* if only one position was given, jump to it */
 		if (range.start != EPOS && !*name) {
-			window_cursor_to(vis->win->win, range.start);
+			view_cursor_to(vis->win->view, range.start);
 			free(line);
 			return true;
 		}
@@ -1740,21 +1978,25 @@ static bool exec_cmdline_command(const char *cmdline) {
 			free(line);
 			return false;
 		}
-		range = (Filerange){ .start = 0, .end = text_size(vis->win->text->data) };
 	}
 	/* skip leading white space */
 	while (*name == ' ')
 		name++;
 	char *param = name;
-	while (*param && *param != ' ') {
-		if (*param == '!') {
-			opt |= CMD_OPT_FORCE;
-			break;
-		}
+	while (*param && isalpha(*param))
 		param++;
+
+	if (*param == '!') {
+		if (param != name) {
+			opt |= CMD_OPT_FORCE;
+			*param = ' ';
+		} else {
+			param++;
+		}
 	}
-	if (*param)
-		*param++ = '\0'; /* truncate by overwriting ' ' or '!' */
+
+	memmove(param+1, param, strlen(param)+1);
+	*param++ = '\0'; /* separate command name from parameters */
 
 	Command *cmd = lookup_cmd(name);
 	if (!cmd) {
@@ -1764,7 +2006,7 @@ static bool exec_cmdline_command(const char *cmdline) {
 	}
 
 	char *s = param;
-	const char *argv[32] = { line };
+	const char *argv[32] = { name };
 	for (int i = 1; i < LENGTH(argv); i++) {
 		while (s && *s && *s == ' ')
 			s++;
@@ -1822,7 +2064,7 @@ static void settings_apply(const char **settings) {
 static bool vis_window_new(const char *file) {
 	if (!editor_window_new(vis, file))
 		return false;
-	Syntax *s = window_syntax_get(vis->win->win);
+	Syntax *s = view_syntax_get(vis->win->view);
 	if (s)
 		settings_apply(s->settings);
 	return true;
@@ -1831,16 +2073,16 @@ static bool vis_window_new(const char *file) {
 static bool vis_window_new_fd(int fd) {
 	if (!editor_window_new_fd(vis, fd))
 		return false;
-	Syntax *s = window_syntax_get(vis->win->win);
+	Syntax *s = view_syntax_get(vis->win->view);
 	if (s)
 		settings_apply(s->settings);
 	return true;
 }
 
-static bool vis_window_split(EditorWin *win) {
+static bool vis_window_split(Win *win) {
 	if (!editor_window_split(win))
 		return false;
-	Syntax *s = window_syntax_get(vis->win->win);
+	Syntax *s = view_syntax_get(vis->win->view);
 	if (s)
 		settings_apply(s->settings);
 	return true;
@@ -1954,6 +2196,7 @@ static void mainloop() {
 	sigemptyset(&blockset);
 	sigaddset(&blockset, SIGWINCH);
 	sigprocmask(SIG_BLOCK, &blockset, NULL);
+	signal(SIGPIPE, SIG_IGN);
 	editor_draw(vis);
 	vis->running = true;
 
@@ -1995,7 +2238,7 @@ int main(int argc, char *argv[]) {
 	while (*arg0 && (*arg0 == '.' || *arg0 == '/'))
 		arg0++;
 	for (int i = 0; i < LENGTH(editors); i++) {
-		if (editors[i].name[0] == arg0[0]) {
+		if (strcmp(editors[i].name, arg0) == 0) {
 			config = &editors[i];
 			break;
 		}
@@ -2010,11 +2253,20 @@ int main(int argc, char *argv[]) {
 		die("Could not load syntax highlighting definitions\n");
 
 	char *cmd = NULL;
+	bool end_of_options = false;
 	for (int i = 1; i < argc; i++) {
-		if (argv[i][0] == '-') {
+		if (argv[i][0] == '-' && !end_of_options) {
 			switch (argv[i][1]) {
-			/* handle command line arguments */
+			case '-':
+				end_of_options = true;
+				break;
+			case 'v':
+				die("vis %s, compiled " __DATE__ " " __TIME__ "\n", VERSION);
+				break;
+			case '\0':
+				break;
 			default:
+				die("Unknown command option: %s\n", argv[i]);
 				break;
 			}
 		} else if (argv[i][0] == '+') {
